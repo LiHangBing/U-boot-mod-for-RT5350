@@ -1,0 +1,2423 @@
+diff -uNr "./Uboot/\346\236\204\345\273\272\346\255\245\351\252\244" "./Uboot-mod/\346\236\204\345\273\272\346\255\245\351\252\244"
+--- "./Uboot/\346\236\204\345\273\272\346\255\245\351\252\244"	1970-01-01 08:00:00.000000000 +0800
++++ "./Uboot-mod/\346\236\204\345\273\272\346\255\245\351\252\244"	2024-10-11 23:30:36.421228000 +0800
+@@ -0,0 +1,68 @@
++环境：Ubuntu 22.04.4 LTS
++
++
++make menuconfig
++	Cross Compiler Path: 输入toolchain/bin的绝对路径（以/为开头的绝对路径）
++	 (RT5350) Chip ID
++	 (256Mb) DRAM Component
++	
++
++直接make，根据报错补救
++	./tools/mkimage: invalid entry point -n
++		检查下最后执行的指令，./tools/mkimage...
++			定位到顶层makefile，readelf -h u-boot | grep "Entry" | awk '{print $$4}'
++		执行，readelf -h u-boot，可以发现，因为语言原因，“Entry“变成了“入口点地址”
++			中文的输出对应行：
++				入口点地址：               0x80200000
++			如果将系统语言改为英文，输出如下
++				Entry point address:               0x80200000
++		把grep后面的“Entry“改成“入口点地址”，根据规律，还要改$$4为$$2
++		即更改IN_SPI分支的readelf -h u-boot | grep "Entry" | awk '{print $$4}'为
++			readelf -h u-boot | grep "入口点地址" | awk '{print $$2}'
++	
++
++将得到的文件：uboot.img烧录到SPI Flash即可
++
++
++
++补丁1：实测发现在SecureCRT执行loadb指令无法下载超过8K的数据，因此更改kermit参数，取消扩展长度数据包特性。
++	cmd_load.c：
++		//a_b[++length] = tochar (2);	/* only long packets */
++		a_b[++length] = tochar (0);	//delete all features by hangbingli
++补丁2：添加spi flash操纵代码
++	spi_flash.c：
++		取消注释：#define SPI_FLASH_DBG_CMD 
++		添加：spi fread、spi ferase及spi fwrite相关代码
++补丁3：启用非必要的命令
++	/config.mk
++		UN_NECESSITY_U_BOOT_CMD_OPEN = ON
++		该启用项需要执行 make menuconfig
++补丁4：考虑取消扩展长度下载速度极慢，添加loadb_fst指令，继承原loadb
++	cmd_load.c：
++	修改loadb_fst指令中kermit协议扩展数据包最大长度为4096-2=4094
++	实测此时比较稳定（CH340转串口）
++补丁5：启动等待时间调整为5s
++	rt2880.h:
++		修改 #define CONFIG_BOOTDELAY	30	/* autoboot after 30 seconds	*/ 
++		为 #define CONFIG_BOOTDELAY	5	/* autoboot after 30 seconds	*/
++
++U-BOOT调试：
++	波特率57600 ，打开串口，开机按4
++	加载img镜像：loadb 或 loadb_fst
++	擦除：spi ferase 0 40000			#根据镜像大小设置
++	写入：spi fwrite 0 80100000 xxxxx		#xxxxx是loadb下载的大小
++	重启：reset
++
++无线参数烧录（镜像文件从原始固件取出，此处参考：https://openwrt.org/toh/7links/px4885）
++	spi ferase 40000 10000
++	loadb_fst
++	spi fwrite 40000 0x80100000 10000
++
++openwrt烧录
++	spi ferase 50000 800000
++	loadb_fst
++	spi fwrite 50000 0x80100000 xxxxxxxx
++
++
++
++
+diff -uNr ./Uboot/board/rt2880/rt2880.c ./Uboot-mod/board/rt2880/rt2880.c
+--- ./Uboot/board/rt2880/rt2880.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/board/rt2880/rt2880.c	2024-09-22 19:31:24.711409000 +0800
+@@ -43,7 +43,7 @@
+  * the actually available RAM size between addresses `base' and
+  * `base + maxsize'.
+  */
+-long get_ram_size(volatile long *base, long maxsize)
++long get_ram_size(volatile long *base, long maxsize)		//获取RAM大小
+ {
+ 	volatile long *addr;
+ 	long           save[32];
+@@ -52,6 +52,7 @@
+ 	long           size;
+ 	int            i = 0;
+ 
++	//RAM 地址最高位为1,前面的均为0,对这些区域保存原来的值，随后写入标记 RAM大小一般为2^n
+ 	for (cnt = (maxsize / sizeof (long)) >> 1; cnt > 0; cnt >>= 1) {
+ 		addr = base + cnt;	/* pointer arith! */
+ 		save[i++] = *addr;
+@@ -67,8 +68,9 @@
+ 	*addr = 0;
+ 
+ 	
+-	if ((val = *addr) != 0) {
++	if ((val = *addr) != 0) {				//如果往起始地址里面写0失败
+ 		/* Restore the original data before leaving the function.
++		 *	恢复RAM标记之前的值
+ 		 */
+ 		*addr = save[i];
+ 		for (cnt = 1; cnt < maxsize / sizeof(long); cnt <<= 1) {
+@@ -79,17 +81,18 @@
+ 	}
+ 
+ 	for (cnt = 1; cnt < maxsize / sizeof (long); cnt <<= 1) {
+-		addr = base + cnt;	/* pointer arith! */
++		addr = base + cnt;	/* pointer arith! */		//从低到高
+ 
+ 	//	printf("\n retrieve addr=%08X \n",addr);
+-			val = *addr;
+-		*addr = save[--i];
+-		if (val != ~cnt) {
++			val = *addr;				//取出写了标记的内存值
++		*addr = save[--i];				//标记值已取出，恢复原值（因为可能直接遍历到最大地址）
++		if (val != ~cnt) {				//如果和标记不匹配，说明RAM最大到此
+ 			size = cnt * sizeof (long);
+ 			
+ 		//	printf("\n The Addr[%08X],do back ring  \n",addr);
+ 			
+ 			/* Restore the original data before leaving the function.
++			 *		恢复RAM标记之前的值
+ 			 */
+ 			for (cnt <<= 1; cnt < maxsize / sizeof (long); cnt <<= 1) {
+ 				addr  = base + cnt;
+@@ -104,7 +107,7 @@
+ 
+ 
+ 
+-long int initdram(int board_type)
++long int initdram(int board_type)			//初始化SDRAM
+ {
+ 	ulong size, max_size       = MAX_SDRAM_SIZE;
+ 	ulong our_address;
+@@ -138,7 +141,7 @@
+ 	 
+ 
+ 
+-	size = get_ram_size((ulong *)CFG_SDRAM_BASE, MAX_SDRAM_SIZE);
++	size = get_ram_size((ulong *)CFG_SDRAM_BASE, MAX_SDRAM_SIZE);		//获取RAM大小
+ 	if (size > max_size)
+ 	{
+ 		max_size = size;
+diff -uNr ./Uboot/board/rt2880/serial.c ./Uboot-mod/board/rt2880/serial.c
+--- ./Uboot/board/rt2880/serial.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/board/rt2880/serial.c	2024-09-27 20:57:09.036266000 +0800
+@@ -106,8 +106,8 @@
+ 
+ 	switch(clk_sel) {
+ 		case 0:
+-			cpu_clock = (360*1000*1000);
+-			mips_bus_feq = (120*1000*1000);
++			cpu_clock = (360*1000*1000);			//CPU时钟360M
++			mips_bus_feq = (120*1000*1000);			//BUS时钟120M
+ 			break;
+ 		case 1:
+ 			//reserved
+@@ -268,13 +268,14 @@
+       defined(RT6352_ASIC_BOARD) || defined(RT6352_FPGA_BOARD) || \
+       defined(RT71100_ASIC_BOARD) || defined(RT71100_FPGA_BOARD)
+ 	*(unsigned long *)(RALINK_SYSCTL_BASE + 0x0034) = cpu_to_le32(1<<19|1<<12);
++			//复位 UARTL_RST(Reset the UART Lite block) UART_RST(Reset the UART block)
+ #elif defined(RT6855A_ASIC_BOARD) || defined(RT6855A_FPGA_BOARD)
+ 	//use bbu_init_uart insead and avoid the compiling error
+ #else
+ #error "undefined Platform"
+ #endif
+ 	/* RST Control change from W1C to W1W0 to reset, update 20080812 */
+-	*(unsigned long *)(RALINK_SYSCTL_BASE + 0x0034) = 0;
++	*(unsigned long *)(RALINK_SYSCTL_BASE + 0x0034) = 0;		//结束复位
+ 	//clock_divisor = (CPU_CLOCK_RATE / SERIAL_CLOCK_DIVISOR / gd->baudrate);
+ #if defined(RT3883_ASIC_BOARD) || defined(RT3883_FPGA_BOARD) || \
+     defined(RT3352_ASIC_BOARD) || defined(RT3352_FPGA_BOARD) || \
+@@ -283,17 +284,19 @@
+     defined(RT6352_ASIC_BOARD) || defined(RT6352_FPGA_BOARD) || \
+     defined(RT71100_ASIC_BOARD) || defined(RT71100_FPGA_BOARD)
+ 	clock_divisor = (40*1000*1000/ SERIAL_CLOCK_DIVISOR / CONFIG_BAUDRATE);
++		/////////////////////
+ #else
+ 	clock_divisor = (mips_bus_feq/ SERIAL_CLOCK_DIVISOR / CONFIG_BAUDRATE);
+ #endif
+ 
++	//串口 IER: Interrupt Enable Register 和 FCR: FIFO Control Register
+ 	IER(CFG_RT2880_CONSOLE) = 0;					/* Disable for now */
+ 	FCR(CFG_RT2880_CONSOLE) = 0;					/* No fifos enabled */
+ 
+-	/* set baud rate */
+-	LCR(CFG_RT2880_CONSOLE) = LCR_WLS0 | LCR_WLS1 | LCR_DLAB;
+-	DLL(CFG_RT2880_CONSOLE) = clock_divisor & 0xffff;
+-	LCR(CFG_RT2880_CONSOLE) = LCR_WLS0 | LCR_WLS1;
++	/* set baud rate */		//串口配置
++	LCR(CFG_RT2880_CONSOLE) = LCR_WLS0 | LCR_WLS1 | LCR_DLAB;	//数据8bits
++	DLL(CFG_RT2880_CONSOLE) = clock_divisor & 0xffff;			//分频系数
++	LCR(CFG_RT2880_CONSOLE) = LCR_WLS0 | LCR_WLS1;				//数据8bits
+ }
+ 
+ 
+@@ -368,7 +371,7 @@
+ /*
+  * Output a single byte to the serial port.
+  */
+-void serial_putc (const char c)
++void serial_putc (const char c)				//串口输出一个字符
+ {
+ #if defined (RT6855A_FPGA_BOARD) || defined (RT6855A_ASIC_BOARD) 
+ 	while (!(ra_inb(CR_UART_LSR) & LSR_TEMT));
+@@ -377,13 +380,13 @@
+ 		serial_putc ('\r');
+ #else
+ 	/* wait for room in the tx FIFO on UART */
+-	while ((LSR(CFG_RT2880_CONSOLE) & LSR_TEMT) == 0);
++	while ((LSR(CFG_RT2880_CONSOLE) & LSR_TEMT) == 0);		//等待Transmitter Empty
+ 
+-	TBR(CFG_RT2880_CONSOLE) = c;
++	TBR(CFG_RT2880_CONSOLE) = c;			//将字符写入Transmit Buffer Register
+ 
+ 	/* If \n, also do \r */
+ 	if (c == '\n')
+-		serial_putc ('\r');
++		serial_putc ('\r');			//\n后面要追加\r
+ #endif
+ }
+ 
+@@ -392,7 +395,7 @@
+  * otherwise. When the function is succesfull, the character read is
+  * written into its argument c.
+  */
+-int serial_tstc (void)
++int serial_tstc (void)				//检查串口是否有数据
+ {
+ #if defined (RT6855A_FPGA_BOARD) || defined (RT6855A_ASIC_BOARD) 
+ 	return (ra_inb(CR_UART_LSR) & LSR_DR);
+@@ -406,14 +409,14 @@
+  * otherwise. When the function is succesfull, the character read is
+  * written into its argument c.
+  */
+-int serial_getc (void)
++int serial_getc (void)				//从串口获取一个字符
+ {
+ #if defined (RT6855A_FPGA_BOARD) || defined (RT6855A_ASIC_BOARD) 
+ 	while (!(ra_inb(CR_UART_LSR) & LSR_DR));
+ 	return (char) (ra_inb(CR_UART_RBR) & 0xff);
+ #else
+-	while (!(LSR(CFG_RT2880_CONSOLE) & LSR_DR));
+-	return (char) RBR(CFG_RT2880_CONSOLE) & 0xff;
++	while (!(LSR(CFG_RT2880_CONSOLE) & LSR_DR));			//等待Data Ready
++	return (char) RBR(CFG_RT2880_CONSOLE) & 0xff;		//取出Receive Buffer Register数据
+ #endif
+ }
+ 
+diff -uNr ./Uboot/common/cmd_load.c ./Uboot-mod/common/cmd_load.c
+--- ./Uboot/common/cmd_load.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/common/cmd_load.c	2024-09-28 23:56:41.392363000 +0800
+@@ -769,7 +769,8 @@
+ 			break;
+ 		/* handle CAPAS - the capabilities mask */
+ 		/* ignore what he says - I only do long packets - I don't do windows */
+-		a_b[++length] = tochar (2);	/* only long packets */
++		//a_b[++length] = tochar (2);	/* only long packets */
++		a_b[++length] = tochar (0);	//delete all features by hangbingli
+ 		a_b[++length] = tochar (0);	/* no windows */
+ 		a_b[++length] = tochar (94);	/* large packet msb */
+ 		a_b[++length] = tochar (94);	/* large packet lsb */
+@@ -1055,3 +1056,367 @@
+ 
+ #endif
+ 
++
++
++
++////////////////////////////////////////////////////////////////////////////////////
++int do_load_serial_bin_fst (cmd_tbl_t *cmdtp, int flag, int argc, char *argv[]);
++static ulong load_serial_bin_fst (ulong offset);
++static int k_recv_fst (void);
++void handle_send_packet_fst (int n);
++
++
++int do_load_serial_bin_fst (cmd_tbl_t *cmdtp, int flag, int argc, char *argv[])
++{
++
++	DECLARE_GLOBAL_DATA_PTR;
++	ulong offset = 0;
++	ulong addr;
++	int load_baudrate, current_baudrate;
++	int rcode = 0;
++	char *s;
++
++	/* pre-set offset from CFG_LOAD_ADDR */
++	offset = CFG_LOAD_ADDR;
++
++	/* pre-set offset from $loadaddr */
++	if ((s = getenv("loadaddr")) != NULL) {
++		offset = simple_strtoul(s, NULL, 16);
++	}
++
++	load_baudrate = current_baudrate = gd->baudrate;
++
++	if (argc >= 2) {
++		offset = simple_strtoul(argv[1], NULL, 16);
++	}
++	if (argc == 3) {
++		load_baudrate = (int)simple_strtoul(argv[2], NULL, 10);
++
++		/* default to current baudrate */
++		if (load_baudrate == 0)
++			load_baudrate = current_baudrate;
++	}
++
++	if (load_baudrate != current_baudrate) {
++		printf ("## Switch baudrate to %d bps and press ENTER ...\n",
++			load_baudrate);
++		udelay(50000);
++		gd->baudrate = load_baudrate;
++		serial_setbrg ();
++		udelay(50000);
++		for (;;) {
++			if (getc() == '\r')
++				break;
++		}
++	}
++
++	printf ("## Ready for binary (kermit) download "
++		"to 0x%08lX at %d bps...\n",
++		offset,
++		load_baudrate);
++	addr = load_serial_bin_fst (offset);
++
++	if (addr == ~0) {
++		load_addr = 0;
++		printf ("## Binary (kermit) download aborted\n");
++		rcode = 1;
++	} else {
++		printf ("## Start Addr      = 0x%08lX\n", addr);
++		load_addr = addr;
++	}
++
++	if (load_baudrate != current_baudrate) {
++		printf ("## Switch baudrate to %d bps and press ESC ...\n",
++			current_baudrate);
++		udelay (50000);
++		gd->baudrate = current_baudrate;
++		serial_setbrg ();
++		udelay (50000);
++		for (;;) {
++			if (getc() == 0x1B) /* ESC */
++				break;
++		}
++	}
++
++	return rcode;
++}
++
++
++static ulong load_serial_bin_fst (ulong offset)
++{
++	int size, i;
++	char buf[32];
++
++	set_kerm_bin_mode ((ulong *) offset);
++	size = k_recv_fst ();
++
++	/*
++	 * Gather any trailing characters (for instance, the ^D which
++	 * is sent by 'cu' after sending a file), and give the
++	 * box some time (100 * 1 ms)
++	 */
++	for (i=0; i<100; ++i) {
++		if (tstc()) {
++			(void) getc();
++		}
++		udelay(1000);
++	}
++
++	flush_cache (offset, size);
++
++	printf("## Total Size      = 0x%08x = %d Bytes\n", size, size);
++	sprintf(buf, "%X", size);
++	setenv("filesize", buf);
++
++	return offset;
++}
++
++
++/* k_recv receives a OS Open image file over kermit line */
++static int k_recv_fst (void)
++{
++	char new_char;
++	char k_state, k_state_saved;
++	int sum;
++	int done;
++	int length;
++	int n, last_n;
++	int z = 0;
++	int len_lo, len_hi;
++
++	/* initialize some protocol parameters */
++	his_eol = END_CHAR;		/* default end of line character */
++	his_pad_count = 0;
++	his_pad_char = '\0';
++	his_quote = K_ESCAPE;
++
++	/* initialize the k_recv and k_data state machine */
++	done = 0;
++	k_state = 0;
++	k_data_init ();
++	k_state_saved = k_state;
++	k_data_save ();
++	n = 0;				/* just to get rid of a warning */
++	last_n = -1;
++
++	while (!done) {
++		/* set the send packet pointer to begining of send packet parms */
++		send_ptr = send_parms;
++
++		/* get a packet */
++		/* wait for the starting character or ^C */
++		for (;;) {
++			switch (getc ()) {
++			case START_CHAR:	/* start packet */
++				goto START_FST;
++			case ETX_CHAR:		/* ^C waiting for packet */
++				return (0);
++			default:
++				;
++			}
++		}
++START_FST:
++		/* get length of packet */
++		sum = 0;
++		new_char = getc ();
++		if ((new_char & 0xE0) == 0)
++			goto packet_error;
++		sum += new_char & 0xff;
++		length = untochar (new_char);
++		/* get sequence number */
++		new_char = getc ();
++		if ((new_char & 0xE0) == 0)
++			goto packet_error;
++		sum += new_char & 0xff;
++		n = untochar (new_char);
++		--length;
++
++		if (n == last_n) {
++			/* same sequence number, restore the previous state */
++			k_state = k_state_saved;
++			k_data_restore ();
++		} else {
++			/* new sequence number, checkpoint the download */
++			last_n = n;
++			k_state_saved = k_state;
++			k_data_save ();
++		}
++		/* END NEW CODE */
++
++		/* get packet type */
++		new_char = getc ();
++		if ((new_char & 0xE0) == 0)
++			goto packet_error;
++		sum += new_char & 0xff;
++		k_state = new_char;
++		--length;
++		/* check for extended length */
++		if (length == -2) {
++			/* (length byte was 0, decremented twice) */
++			/* get the two length bytes */
++			new_char = getc ();
++			if ((new_char & 0xE0) == 0)
++				goto packet_error;
++			sum += new_char & 0xff;
++			len_hi = untochar (new_char);
++			new_char = getc ();
++			if ((new_char & 0xE0) == 0)
++				goto packet_error;
++			sum += new_char & 0xff;
++			len_lo = untochar (new_char);
++			length = len_hi * 95 + len_lo;
++			/* check header checksum */
++			new_char = getc ();
++			if ((new_char & 0xE0) == 0)
++				goto packet_error;
++			if (new_char != tochar ((sum + ((sum >> 6) & 0x03)) & 0x3f))
++				goto packet_error;
++			sum += new_char & 0xff;
++/* --length; */ /* new length includes only data and block check to come */
++		}
++		/* bring in rest of packet */
++		while (length > 1) {
++			new_char = getc ();
++			if ((new_char & 0xE0) == 0)
++				goto packet_error;
++			sum += new_char & 0xff;
++			--length;
++			if (k_state == DATA_TYPE) {
++				/* pass on the data if this is a data packet */
++				k_data_char (new_char);
++			} else if (k_state == SEND_TYPE) {
++				/* save send pack in buffer as is */
++				*send_ptr++ = new_char;
++				/* if too much data, back off the pointer */
++				if (send_ptr >= &send_parms[SEND_DATA_SIZE])
++					--send_ptr;
++			}
++		}
++		/* get and validate checksum character */
++		new_char = getc ();
++		if ((new_char & 0xE0) == 0)
++			goto packet_error;
++		if (new_char != tochar ((sum + ((sum >> 6) & 0x03)) & 0x3f))
++			goto packet_error;
++		/* get END_CHAR */
++		new_char = getc ();
++		if (new_char != END_CHAR) {
++		  packet_error:
++			/* restore state machines */
++			k_state = k_state_saved;
++			k_data_restore ();
++			/* send a negative acknowledge packet in */
++			send_nack (n);
++		} else if (k_state == SEND_TYPE) {
++			/* crack the protocol parms, build an appropriate ack packet */
++			handle_send_packet_fst (n);
++		} else {
++			/* send simple acknowledge packet in */
++			send_ack (n);
++			/* quit if end of transmission */
++			if (k_state == BREAK_TYPE)
++				done = 1;
++		}
++		++z;
++	}
++	return ((ulong) os_data_addr - (ulong) bin_start_address);
++}
++
++
++void handle_send_packet_fst (int n)
++{
++	int length = 3;
++	int bytes;
++
++	/* initialize some protocol parameters */
++	his_eol = END_CHAR;		/* default end of line character */
++	his_pad_count = 0;
++	his_pad_char = '\0';
++	his_quote = K_ESCAPE;
++
++	/* ignore last character if it filled the buffer */
++	if (send_ptr == &send_parms[SEND_DATA_SIZE - 1])
++		--send_ptr;
++	bytes = send_ptr - send_parms;	/* how many bytes we'll process */
++	do {
++		if (bytes-- <= 0)
++			break;
++		/* handle MAXL - max length */
++		/* ignore what he says - most I'll take (here) is 94 */
++		a_b[++length] = tochar (94);
++		if (bytes-- <= 0)
++			break;
++		/* handle TIME - time you should wait for my packets */
++		/* ignore what he says - don't wait for my ack longer than 1 second */
++		a_b[++length] = tochar (1);
++		if (bytes-- <= 0)
++			break;
++		/* handle NPAD - number of pad chars I need */
++		/* remember what he says - I need none */
++		his_pad_count = untochar (send_parms[2]);
++		a_b[++length] = tochar (0);
++		if (bytes-- <= 0)
++			break;
++		/* handle PADC - pad chars I need */
++		/* remember what he says - I need none */
++		his_pad_char = ktrans (send_parms[3]);
++		a_b[++length] = 0x40;	/* He should ignore this */
++		if (bytes-- <= 0)
++			break;
++		/* handle EOL - end of line he needs */
++		/* remember what he says - I need CR */
++		his_eol = untochar (send_parms[4]);
++		a_b[++length] = tochar (END_CHAR);
++		if (bytes-- <= 0)
++			break;
++		/* handle QCTL - quote control char he'll use */
++		/* remember what he says - I'll use '#' */
++		his_quote = send_parms[5];
++		a_b[++length] = '#';
++		if (bytes-- <= 0)
++			break;
++		/* handle QBIN - 8-th bit prefixing */
++		/* ignore what he says - I refuse */
++		a_b[++length] = 'N';
++		if (bytes-- <= 0)
++			break;
++		/* handle CHKT - the clock check type */
++		/* ignore what he says - I do type 1 (for now) */
++		a_b[++length] = '1';
++		if (bytes-- <= 0)
++			break;
++		/* handle REPT - the repeat prefix */
++		/* ignore what he says - I refuse (for now) */
++		a_b[++length] = 'N';
++		if (bytes-- <= 0)
++			break;
++		/* handle CAPAS - the capabilities mask */
++		/* ignore what he says - I only do long packets - I don't do windows */
++		//a_b[++length] = tochar (2);	/* only long packets */
++		a_b[++length] = tochar (2);	
++		a_b[++length] = tochar (0);	/* no windows */
++		a_b[++length] = tochar (43);	/* large packet msb */		//4096-2=4094
++		a_b[++length] = tochar (9);	/* large packet lsb */
++	} while (0);
++
++	a_b[0] = START_CHAR;
++	a_b[1] = tochar (length);
++	a_b[2] = tochar (n);
++	a_b[3] = ACK_TYPE;
++	a_b[++length] = '\0';
++	a_b[length] = tochar (chk1 (&a_b[1]));
++	a_b[++length] = his_eol;
++	a_b[++length] = '\0';
++	s1_sendpacket (a_b);
++}
++
++
++U_BOOT_CMD(
++	loadb_fst, 3, 0,	do_load_serial_bin_fst,
++	"loadb_fst   - load binary file over serial line fast (kermit mode)\n",
++	"[ off ] [ baud ]\n"
++	"    - load binary file fast over serial line"
++	" with offset 'off' and baudrate 'baud'\n"
++);
++
++//////////////////////////////////////////////////////////////////////////////////
+\ 文件末尾没有换行符
+diff -uNr ./Uboot/common/cmd_nvedit.c ./Uboot-mod/common/cmd_nvedit.c
+--- ./Uboot/common/cmd_nvedit.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/common/cmd_nvedit.c	2024-09-24 23:42:16.143439000 +0800
+@@ -523,7 +523,7 @@
+  * or NULL if not found
+  */
+ 
+-char *getenv (uchar *name)
++char *getenv (uchar *name)			//根据名称查找环境变量
+ {
+ 	int i, nxt;
+ 
+diff -uNr ./Uboot/common/console.c ./Uboot-mod/common/console.c
+--- ./Uboot/common/console.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/common/console.c	2024-09-25 23:27:01.890382000 +0800
+@@ -393,7 +393,7 @@
+ int console_init_f (void)
+ {
+ 	DECLARE_GLOBAL_DATA_PTR;
+-	gd->have_console = 1;
++	gd->have_console = 1;				//有控制台
+ #ifdef CONFIG_SILENT_CONSOLE
+ 	if (getenv("silent") != NULL)
+ 		gd->flags |= GD_FLG_SILENT;
+@@ -516,7 +516,7 @@
+ #else /* CFG_CONSOLE_IS_IN_ENV */
+ 
+ /* Called after the relocation - use desired console functions */
+-int console_init_r (void)
++int console_init_r (void)		//初始化控制台
+ {
+ 	DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -536,7 +536,7 @@
+ 		outputdev = search_device (DEV_FLAGS_OUTPUT, "nulldev");
+ #endif
+ 
+-	/* Scan devices looking for input and output devices */
++	/* Scan devices looking for input and output devices */		//扫描设备，找到输入和输出设备
+ 	for (i = 1;
+ 	     (i <= items) && ((inputdev == NULL) || (outputdev == NULL));
+ 	     i++
+@@ -544,25 +544,25 @@
+ 		device_t *dev = ListGetPtrToItem (devlist, i);
+ 
+ 		if ((dev->flags & DEV_FLAGS_INPUT) && (inputdev == NULL)) {
+-			inputdev = dev;
++			inputdev = dev;				//输入设备
+ 		}
+ 		if ((dev->flags & DEV_FLAGS_OUTPUT) && (outputdev == NULL)) {
+-			outputdev = dev;
++			outputdev = dev;			//输出设备
+ 		}
+ 	}
+ 
+ 	/* Initializes output console first */
+ 	if (outputdev != NULL) {
+-		console_setfile (stdout, outputdev);
++		console_setfile (stdout, outputdev);		//标准输出和标准错误
+ 		console_setfile (stderr, outputdev);
+ 	}
+ 
+ 	/* Initializes input console */
+ 	if (inputdev != NULL) {
+-		console_setfile (stdin, inputdev);
++		console_setfile (stdin, inputdev);			//标准输入
+ 	}
+ 
+-	gd->flags |= GD_FLG_DEVINIT;	/* device initialization completed */
++	gd->flags |= GD_FLG_DEVINIT;	/* device initialization completed */	//标记设备已初始化
+ 
+ #ifndef CFG_CONSOLE_INFO_QUIET
+ 	/* Print information */
+@@ -588,7 +588,7 @@
+ 	}
+ #endif /* CFG_CONSOLE_INFO_QUIET */
+ 
+-	/* Setting environment variables */
++	/* Setting environment variables */		//设置环境变量
+ 	for (i = 0; i < 3; i++) {
+ 		setenv (stdio_names[i], stdio_devices[i]->name);
+ 	}
+diff -uNr ./Uboot/common/devices.c ./Uboot-mod/common/devices.c
+--- ./Uboot/common/devices.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/common/devices.c	2024-09-25 23:22:11.373243000 +0800
+@@ -73,20 +73,20 @@
+ 	memset (&dev, 0, sizeof (dev));
+ 
+ 	strcpy (dev.name, "serial");
+-	dev.flags = DEV_FLAGS_OUTPUT | DEV_FLAGS_INPUT | DEV_FLAGS_SYSTEM;
++	dev.flags = DEV_FLAGS_OUTPUT | DEV_FLAGS_INPUT | DEV_FLAGS_SYSTEM;		//输入&输出&系统
+ #ifdef CONFIG_SERIAL_SOFTWARE_FIFO
+ 	dev.putc = serial_buffered_putc;
+ 	dev.puts = serial_buffered_puts;
+ 	dev.getc = serial_buffered_getc;
+ 	dev.tstc = serial_buffered_tstc;
+ #else
+-	dev.putc = serial_putc;
++	dev.putc = serial_putc;				//设备的输入输出函数
+ 	dev.puts = serial_puts;
+ 	dev.getc = serial_getc;
+ 	dev.tstc = serial_tstc;
+ #endif
+ 
+-	device_register (&dev);
++	device_register (&dev);			//注册设备，将设备添加到设备列表
+ 
+ #ifdef CFG_DEVICE_NULLDEV
+ 	memset (&dev, 0, sizeof (dev));
+@@ -157,15 +157,15 @@
+ }
+ #endif	/* CFG_DEVICE_DEREGISTER */
+ 
+-int devices_init (void)
++int devices_init (void)			//初始化U-boot的设备
+ {
+ #ifndef CONFIG_ARM     /* already relocated for current ARM implementation */
+ 	DECLARE_GLOBAL_DATA_PTR;
+ 
+-	ulong relocation_offset = gd->reloc_off;
++	ulong relocation_offset = gd->reloc_off;			//重定向偏移
+ 	int i;
+ 
+-	/* relocate device name pointers */
++	/* relocate device name pointers */			//将设备字符串偏移
+ 	for (i = 0; i < (sizeof (stdio_names) / sizeof (char *)); ++i) {
+ 		stdio_names[i] = (char *) (((ulong) stdio_names[i]) +
+ 						relocation_offset);
+@@ -173,7 +173,7 @@
+ #endif
+ 
+ 	/* Initialize the list */
+-	devlist = ListCreate (sizeof (device_t));
++	devlist = ListCreate (sizeof (device_t));		//创建设备表
+ 
+ 	if (devlist == NULL) {
+ 		eputs ("Cannot initialize the list of devices!\n");
+@@ -194,7 +194,7 @@
+ #ifdef CONFIG_LOGBUFFER
+ 	drv_logbuff_init ();
+ #endif
+-	drv_system_init ();
++	drv_system_init ();			//初始化设备驱动（serial）
+ #ifdef CONFIG_SERIAL_MULTI
+ 	serial_devices_init ();
+ #endif
+diff -uNr ./Uboot/common/dlmalloc.c ./Uboot-mod/common/dlmalloc.c
+--- ./Uboot/common/dlmalloc.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/common/dlmalloc.c	2024-09-24 22:05:50.564591000 +0800
+@@ -1491,14 +1491,14 @@
+  IAV(120), IAV(121), IAV(122), IAV(123), IAV(124), IAV(125), IAV(126), IAV(127)
+ };
+ 
+-void malloc_bin_reloc (void)
++void malloc_bin_reloc (void)    //重定位malloc用来维护chunk的数据结构
+ {
+ 	DECLARE_GLOBAL_DATA_PTR;
+ 
+-	unsigned long *p = (unsigned long *)(&av_[2]);
++	unsigned long *p = (unsigned long *)(&av_[2]);    //块索引
+ 	int i;
+ 	for (i=2; i<(sizeof(av_)/sizeof(mbinptr)); ++i) {
+-		*p++ += gd->reloc_off;
++		*p++ += gd->reloc_off;      //块索引位置偏移到新位置
+ 	}
+ }
+ 
+diff -uNr ./Uboot/common/env_common.c ./Uboot-mod/common/env_common.c
+--- ./Uboot/common/env_common.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/common/env_common.c	2024-09-24 23:41:10.783521000 +0800
+@@ -203,7 +203,7 @@
+ 	}
+ }
+ 
+-void env_relocate (void)
++void env_relocate (void)			//分配并读取环境变量
+ {
+ 	DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -232,9 +232,9 @@
+ 	/*
+ 	 * After relocation to RAM, we can always use the "memory" functions
+ 	 */
+-	env_get_char = env_get_char_memory;
++	env_get_char = env_get_char_memory;			//根据下标获取环境变量函数
+ 
+-	if (gd->env_valid == 0) {
++	if (gd->env_valid == 0) {			//环境变量无效
+ #if defined(CONFIG_GTH)	|| defined(CFG_ENV_IS_NOWHERE)	/* Environment not changable */
+ 		puts ("Using default environment\n\n");
+ #else
+@@ -251,17 +251,17 @@
+ 		memset (env_ptr, 0, sizeof(env_t));
+ 		memcpy (env_ptr->data,
+ 			default_environment,
+-			sizeof(default_environment));
++			sizeof(default_environment));		//复制默认环境变量
+ #ifdef CFG_REDUNDAND_ENVIRONMENT
+ 		env_ptr->flags = 0xFF;
+ #endif
+-		env_crc_update ();
+-		gd->env_valid = 1;
++		env_crc_update ();			//更新环境变量CRC
++		gd->env_valid = 1;			//环境变量设置为有效
+ 	}
+ 	else {
+-		env_relocate_spec ();
++		env_relocate_spec ();		//环境变量有效，从flash读取环境变量到 env_ptr
+ 	}
+-	gd->env_addr = (ulong)&(env_ptr->data);
++	gd->env_addr = (ulong)&(env_ptr->data);		//环境变量数据存到全局变量
+ 
+ #ifdef CONFIG_AMIGAONEG3SE
+ 	disable_nvram();
+diff -uNr ./Uboot/common/env_spi.c ./Uboot-mod/common/env_spi.c
+--- ./Uboot/common/env_spi.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/common/env_spi.c	2024-09-24 22:34:28.598397000 +0800
+@@ -50,12 +50,12 @@
+ {
+ 	DECLARE_GLOBAL_DATA_PTR;
+ 
+-	gd->env_addr = (ulong)&default_environment[0];
+-	gd->env_valid = 0;
++	gd->env_addr = (ulong)&default_environment[0];		//默认环境变量参数
++	gd->env_valid = 0;									//环境变量暂时无效
+ 	return (0);
+ }
+ 
+-int spi_env_init(void)
++int spi_env_init(void)				//初始化环境变量
+ {
+ 	DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -63,15 +63,16 @@
+ 	if (env_ptr == NULL)
+ 		return -1;
+ 
++		//从spi中读取环境变量
+ 	if (raspi_read((u8 *)env_ptr, (unsigned int)flash_addr, CFG_ENV_SIZE) != CFG_ENV_SIZE)
+ 		return -1;
+-	else if (crc32(0, env_ptr->data, ENV_SIZE) == env_ptr->crc) {
++	else if (crc32(0, env_ptr->data, ENV_SIZE) == env_ptr->crc) {		//CRC校验
+ 		gd->env_addr  = (ulong)&(env_ptr->data);
+ 		gd->env_valid = 1;
+ 		return(0);
+ 	}
+ 
+-	gd->env_addr  = (ulong)&default_environment[0];
++	gd->env_addr  = (ulong)&default_environment[0];		//校验失败，使用默认环境变量
+ 	gd->env_valid = 0;
+ 	return (0);
+ }
+diff -uNr ./Uboot/common/exports.c ./Uboot-mod/common/exports.c
+--- ./Uboot/common/exports.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/common/exports.c	2024-09-25 23:08:44.667436000 +0800
+@@ -10,20 +10,21 @@
+ 	return XF_VERSION;
+ }
+ 
+-void jumptable_init (void)
++void jumptable_init (void)			//跳转表初始化
+ {
+ 	DECLARE_GLOBAL_DATA_PTR;
+ 	int i;
+ 
+-	gd->jt = (void **) malloc (XF_MAX * sizeof (void *));
++	gd->jt = (void **) malloc (XF_MAX * sizeof (void *));			//分配内存
+ 	for (i = 0; i < XF_MAX; i++)
+-		gd->jt[i] = (void *) dummy;
++		gd->jt[i] = (void *) dummy;				//默认为空函数
++		//推测函数调用都是相对寻址，所以没有偏移
+ 
+-	gd->jt[XF_get_version] = (void *) get_version;
+-	gd->jt[XF_malloc] = (void *) malloc;
+-	gd->jt[XF_free] = (void *) free;
+-	gd->jt[XF_get_timer] = (void *)get_timer;
+-	gd->jt[XF_udelay] = (void *)udelay;
++	gd->jt[XF_get_version] = (void *) get_version;			//查版本
++	gd->jt[XF_malloc] = (void *) malloc;					//分配内存
++	gd->jt[XF_free] = (void *) free;						//释放内存
++	gd->jt[XF_get_timer] = (void *)get_timer;				//获取定时器相对计时
++	gd->jt[XF_udelay] = (void *)udelay;						//微秒延时
+ #if defined(CONFIG_I386) || defined(CONFIG_PPC)
+ 	gd->jt[XF_install_hdlr] = (void *) irq_install_handler;
+ 	gd->jt[XF_free_hdlr] = (void *) irq_free_handler;
+diff -uNr ./Uboot/config.mk ./Uboot-mod/config.mk
+--- ./Uboot/config.mk	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/config.mk	2024-09-29 23:19:28.017848000 +0800
+@@ -24,7 +24,8 @@
+ 
+ # Set with ON/OFF
+ 
+-UN_NECESSITY_U_BOOT_CMD_OPEN = OFF
++#启用非必要的命令
++UN_NECESSITY_U_BOOT_CMD_OPEN = ON
+ 
+ ######## RT2880 test function option configuration ##########################
+ 
+diff -uNr ./Uboot/.config.old ./Uboot-mod/.config.old
+--- ./Uboot/.config.old	1970-01-01 08:00:00.000000000 +0800
++++ ./Uboot-mod/.config.old	2024-09-29 23:18:40.481134000 +0800
+@@ -0,0 +1,27 @@
++#
++# Automatically generated by make menuconfig: don't edit
++#
++CONFIG_CROSS_COMPILER_PATH="/home/hangbingli/ralink_sdk-0.1c/Uboot/toolchain/bin"
++ASIC_BOARD=y
++# RT2880_ASIC_BOARD is not set
++# RT3350_ASIC_BOARD is not set
++# RT3052_ASIC_BOARD is not set
++# RT3352_ASIC_BOARD is not set
++# RT3883_ASIC_BOARD is not set
++RT5350_ASIC_BOARD=y
++# RT6855A_ASIC_BOARD is not set
++RT5350_MP=y
++P5_MAC_TO_NONE_MODE=y
++ON_BOARD_SPI_FLASH_COMPONENT=y
++UBOOT_RAM=y
++ON_BOARD_SDR=y
++# ON_BOARD_64M_DRAM_COMPONENT is not set
++# ON_BOARD_128M_DRAM_COMPONENT is not set
++ON_BOARD_256M_DRAM_COMPONENT=y
++# ON_BOARD_512M_DRAM_COMPONENT is not set
++ON_BOARD_16BIT_DRAM_BUS=y
++# DUAL_IMAGE_SUPPORT is not set
++# LAN_WAN_PARTITION is not set
++# DRAM_PARAMETERS is not set
++# CPU_PLL_PARAMETERS is not set
++TEXT_BASE=0x80200000
+diff -uNr ./Uboot/cpu/ralink_soc/start.S ./Uboot-mod/cpu/ralink_soc/start.S
+--- ./Uboot/cpu/ralink_soc/start.S	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/cpu/ralink_soc/start.S	2024-09-23 21:21:27.855880000 +0800
+@@ -52,7 +52,7 @@
+ #endif
+ 
+ #define RVECENT(f,n) \
+-   b f; nop
++   b f; nop						//跳转
+ #define XVECENT(f,bev) \
+    b f     ;           \
+    li k0,bev
+@@ -62,7 +62,8 @@
+ 	.globl _start
+ 	.text
+ _start:
+-	RVECENT(reset,0)	/* U-boot entry point */
++	RVECENT(reset,0)	/* U-boot entry point */	
++						//U-boot入口，依次调用C函数board_init_f、board_init_r
+ 	RVECENT(reset,1)	/* software reboot */
+ #if defined(CONFIG_INCA_IP)
+ 	.word INFINEON_EBU_BOOTCFG /* EBU init code, fetched during booting */
+@@ -228,6 +229,8 @@
+ 	.word   0x00000000
+ #endif /* CONFIG_PURPLE */
+ 	.align 4
++
++//U-boot入口
+ reset:
+ #if defined (RT2883_FPGA_BOARD) || defined (RT2883_ASIC_BOARD) || \
+     defined (RT3052_FPGA_BOARD) || defined (RT3052_ASIC_BOARD) || \
+@@ -239,8 +242,8 @@
+     defined (RT6352_FPGA_BOARD) || defined (RT6352_ASIC_BOARD) || \
+     defined (RT71100_FPGA_BOARD) || defined (RT71100_ASIC_BOARD)
+ 	# Initialize the register file
+-	# should not be required with good software practices
+-	or	$1,$0, $0
++	# should not be required with good software practices	将通用寄存器1～31清零
++	or	$1,$0, $0			//读取寄存器0（恒返回0）或运算后存入寄存器1
+ 	or	$2,$0, $0
+ 	or	$3,$0, $0
+ 	or	$4,$0, $0
+@@ -275,7 +278,7 @@
+ # Initialize Misc. Cop0 state	
+ 
+ 	# Read status register
+-	mfc0	$10, $12
++	mfc0	$10, $12		//读取协处理器0寄存器12到通用寄存器10,Processor status and control.
+ 	# Set up Status register:
+ 	# Disable Coprocessor Usable bits
+ 	# Turn off Reduce Power bit
+@@ -289,37 +292,38 @@
+ 	# Clear Interrupt Enable
+ 	# modify by Bruce
+ 	#li	$11, 0x0000ff02
+-	li	$11, 0x00000004
+-	mtc0	$11, $12
++	li	$11, 0x00000004			//加载立即数
++	mtc0	$11, $12			//写入协处理器寄存器12,//???
++					//（参考《Programming the MIPS32® 24K® Core》B.4.1 Status register）
+ 
+-	# Disable watch exceptions
+-	mtc0	$0, $18
++	# Disable watch exceptions	WatchLo1	Low-order watchpoint address
++	mtc0	$0, $18			//观察点寄存器，I R W =0,不使用观察
+ 
+-	# Clear Watch Status bits
++	# Clear Watch Status bits				WatchHi1 High-order watchpoint address
+ 	li	$11, 0x3
+-	mtc0	$11, $19
++	mtc0	$11, $19		//清除观察点标志，I R W 
+ 
+-	# Clear WP bit to avoid watch exception upon user code entry
++	# Clear WP bit to avoid watch exception upon user code entry	
+ 	# Clear IV bit - Interrupts go to general exception vector
+ 	# Clear software interrupts
+-	mtc0	$0, $13
++	mtc0	$0, $13		//Cause of last general exception 清除异常原因寄存器
+ 
+ 	# Set KSeg0 to cacheable
+ 	# Config.K0
+-	mfc0	$10, $16
++	mfc0	$10, $16	//Configuration register	
+ 	li	$11, 0x7
+-	not	$11
++	not	$11			//~0x07
+ 	and	$10, $11
+-	or	$10, 0x3
+-	mtc0	$10, $16
++	or	$10, 0x3	//Config = Config & (~0x07) | 0x03
++	mtc0	$10, $16	//设置VI=0（没有现代 MIPS 技术core 具有虚拟 I-cache。） K0=2（kseg0 可缓存）
+ 
+-	# Clear Count register
+-	mtc0	$0, $9
++	# Clear Count register	Count Free-running counter at pipeline or sub-multiple speed
++	mtc0	$0, $9		//计数器清零，当 Count 的值与 Compare 中的值一致时，将引发中断。
+ 
+ 	# Set compare to -1 to delay 1st count=compare
+ 	# Also, clears timer interrupt
+ 	li	$10, -1
+-	mtc0	$10, $11
++	mtc0	$10, $11	//Compare1 Timer interrupt control.	定时器中断控制，比较值
+ 
+ 	# Cache initialization routine
+ 	# Long and needed on HW 
+@@ -339,39 +343,42 @@
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  */
+ 	mfc0	$10, $16, 1		# .word 0x400a8001
++		//CP0寄存器16.1，Configuration register 1.
+ 
+ 	# Isolate I$ Line Size
+-	sll	$11, $10, 10
+-	srl	$11, 29
++	sll	$11, $10, 10		//逻辑左移10位，IS移出去了
++	srl	$11, 29				//逻辑右移29位，只剩下IL了
+ 
+ 	# Skip ahead if No I$
+-	beq	$11, $0, 10f
++	beq	$11, $0, 10f	//IL（指令）=0,则往下跳转到标号10（RT5350F 32-byte cache line size）
+ 	nop
+ 
+ 	li	$14, 2
+-	sllv	$11, $14, $11		# Now have true I$ line size in bytes
++	sllv	$11, $14, $11	# Now have true I$ line size in bytes 
++			#左移逻辑变量 Line size:2<<IL	（RT5350F 32-byte cache line size）
+ 
+ 	sll	$12, $10, 7
+-	srl	$12, 29
++	srl	$12, 29			//<<7 >>29 = IS
+ 	li	$14, 64
+-	sllv	$12, $14, $12		# I$ Sets per way
++	sllv	$12, $14, $12		# I$ Sets per way	64<<IS		Number of sets per way
+ 
+ 	sll	$13, $10, 13
+-	srl	$13, 29			# I$ Assoc (-1)
+-	add	$13, 1
++	srl	$13, 29			# I$ Assoc (-1)		= IA
++	add	$13, 1			# Associativity/number of ways - calculate as A + 1
+ 	mul	$12, $12, $13		# Total number of sets
+ 
+-	lui	$14, 0x8000		# Get a KSeg0 address for cacheops
++	lui	$14, 0x8000		# Get a KSeg0 address for cacheops	加载高半字立即数 0x80000000
++		//0x80000000为 kseg0 寄存器地址
+ 
+-	# Clear TagLo/TagHi registers
+-	mtc0	$0, $28
+-	mtc0	$0, $29
++	# Clear TagLo/TagHi registers			清除缓存标签/数据寄存器
++	mtc0	$0, $28		//Low-order portion of cache tag interface.
++	mtc0	$0, $29		//Hi-order portion of cache tag interface.
+ 
+-	move	$15, $12	
++	move	$15, $12	//Total number of sets
+ 
+-	# Index Store Tag Cache Op
++	# Index Store Tag Cache Op	索引存储标签缓存操作，将使标签条目无效，清除锁定位，并清除 LRF 位
+ 	# Will invalidate the tag entry, clear the lock bit, and clear the LRF bit
+-1:	cache	0x8, 0($14)
++1:	cache	0x8, 0($14)			//???
+ 	add	$15, -1			# Decrement set counter
+ 
+ 	bne	$15, $0, 1b
+@@ -382,7 +389,7 @@
+ 	# moved to kseg0 and run from the cache to go faster
+ 10:	
+ 
+-	
++	//对数据，缓存和表采用相同方式（DS DL DA）
+ 	# Isolate D$ Line Size
+ 	sll	$11, $10, 19
+ 	srl	$11, 29
+@@ -410,7 +417,7 @@
+ 	# Clear TagLo/TagHi registers
+ 	mtc0	$0, $28
+ 	mtc0	$0, $29
+-	mtc0	$0, $28, 2
++	mtc0	$0, $28, 2		//L1 D-cache
+ 	mtc0	$0, $29, 2
+ 
+ 	move	$15, $12	
+@@ -441,8 +448,9 @@
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  */
+ 
+-	mfc0	$10, $16, 2
++	mfc0	$10, $16, 2				//Config2寄存器
+ 
++	//对L2采用相同方式（SS SL SA）
+ 	# Isolate L2$ Line Size
+ 	sll	$11, $10, 24
+ 	srl	$11, 28
+@@ -486,20 +494,23 @@
+    
+ 10:
+ 	# Determine if we have a TLB 
+-	mfc0	$11, $16
++	mfc0	$11, $16			//Config寄存器
+ 
++	////////
+ 	sll	$11, 22
+-	srl	$11, 29
++	srl	$11, 29			//MT	
++			//MMU type (all MIPS Technologies cores may be configured as type 1 or 3):
+ 
+-	li	$15, 0x1	# MT = 1  => TLB
++	li	$15, 0x1	# MT = 1  => TLB	//MIPS32/64 compliant TLB
+ 	
+-	bne	$11, $15, 15f
++	bne	$11, $15, 15f			//RT5350F 有TLB
+ 	nop
+ 
+-	mfc0	$10, $16, 1			# .word 0x400a8001
++	mfc0	$10, $16, 1			# .word 0x400a8001		Config1寄存器
+ 
+ 	sll	$11, $10, 1
+-	srl	$11, 26		# Number of TLB entries (-1)
++	srl	$11, 26		# Number of TLB entries (-1)	MMUSize
++			//the size of the TLB array (the array has MMUSize+1 entries).
+ 
+ 	mtc0	$0, $2		# EntryLo0 
+ 	mtc0	$0, $3		# EntryLo1
+@@ -511,7 +522,7 @@
+ 1:	
+ 	mtc0	$11, $0		# Index register
+ 	mtc0	$12, $10	# EntryHi
+-	ssnop			#.word 0x00000040	
++	ssnop			#.word 0x00000040	空指令
+ 	ssnop			#.word 0x00000040	
+ 	TLBWI
+ 	add	$12, (2<<13)	# Add 8K to the address to avoid TLB conflict with previous entry
+@@ -1735,7 +1746,7 @@
+ 	lw	gp, 0(ra)
+ #endif
+ 	
+-	la	t9, board_init_f
++	la	t9, board_init_f		//第一个初始化C函数，board_init_f////////////////
+ 	j	t9
+ 	nop
+ 
+@@ -1744,30 +1755,31 @@
+  *
+  * This "function" does not return, instead it continues in RAM
+  * after relocating the monitor code.
++ * 搬移U-boo本体到指定地址，board_init_f调用之
+  *
+- * a0 = addr_sp
+- * a1 = gd
+- * a2 = destination address
++ * a0 = addr_sp					栈顶
++ * a1 = gd						全局变量，存储参数
++ * a2 = destination address		般移的目的地址
+  */
+ 	.globl	relocate_code
+ 	.ent	relocate_code
+ relocate_code:
+-	move	sp, a0		/* Set new stack pointer		*/
++	move	sp, a0		/* Set new stack pointer		*/		//新栈顶
+ 
+-	li	t0, CFG_MONITOR_BASE
++	li	t0, CFG_MONITOR_BASE					//U-boot 第一次加载时入口地址
+ 	la	t3, in_ram
+-	lw	t2, -12(t3)	/* t2 <-- uboot_end_data	*/
+-	move	t1, a2
++	lw	t2, -12(t3)	/* t2 <-- uboot_end_data	*/	//U-boot 第一次加载时结尾地址
++	move	t1, a2				//般移的目的地址
+ 
+ 	/*
+ 	 * Fix GOT pointer:
+-	 *
++	 *		搬移全局变量gp所指向的实体
+ 	 * New GOT-PTR = (old GOT-PTR - CFG_MONITOR_BASE) + Destination Address
+ 	 */
+-	move	t6, gp
+-	sub	gp, CFG_MONITOR_BASE
+-	add	gp, a2			/* gp now adjusted		*/
+-	sub	t6, gp, t6		/* t6 <-- relocation offset	*/
++	move	t6, gp				//原gp地址
++	sub	gp, CFG_MONITOR_BASE	//gp_old - base_old
++	add	gp, a2			/* gp now adjusted		*/	//gp_old + base_new - base_old
++	sub	t6, gp, t6		/* t6 <-- relocation offset	*/	//base_new - base_old
+ 
+ 	/*
+ 	 * t0 = source address
+@@ -1779,11 +1791,11 @@
+ 	 */
+ #ifndef CONFIG_PURPLE
+ 1:
+-	lw	t3, 0(t0)
+-	sw	t3, 0(t1)
+-	addu	t0, 4
+-	ble	t0, t2, 1b
+-	addu	t1, 4			/* delay slot			*/
++	lw	t3, 0(t0)			//加载src
++	sw	t3, 0(t1)			//存入dst
++	addu	t0, 4			//src + 4
++	ble	t0, t2, 1b			//一直拷贝直到末尾
++	addu	t1, 4			/* delay slot			*/		//dst + 4
+ #endif
+ 
+ 	/* If caches were enabled, we would have to flush them here.
+@@ -1791,8 +1803,8 @@
+ 
+ 	/* Jump to where we've relocated ourselves.
+ 	 */
+-	addi	t0, a2, in_ram - _start
+-	j	t0
++	addi	t0, a2, in_ram - _start			//搬移后in_ram的偏移
++	j	t0			//跳转到重定向的相同位置
+ 	nop
+ 
+ 	.word	uboot_end_data
+@@ -1802,7 +1814,7 @@
+ in_ram:
+ 	/* Now we want to update GOT.
+ 	 */
+-	lw	t3, -4(t0)	/* t3 <-- num_got_entries	*/
++	lw	t3, -4(t0)	/* t3 <-- num_got_entries	*/		//t3=num_got_entries
+ 	addi	t4, gp, 8	/* Skipping first two entries.	*/
+ 	li	t2, 2
+ 1:
+@@ -1815,7 +1827,7 @@
+ 	blt	t2, t3, 1b
+ 	addi	t4, 4		/* delay slot			*/
+ 
+-	/* Clear BSS.
++	/* Clear BSS.		清除BSS区域
+ 	 */
+ 	lw	t1, -12(t0)	/* t1 <-- uboot_end_data	*/
+ 	lw	t2, -8(t0)	/* t2 <-- uboot_end		*/
+@@ -1828,7 +1840,7 @@
+ 	sw	zero, 0(t1)	/* delay slot			*/
+ 
+ 	move	a0, a1
+-	la	t9, board_init_r
++	la	t9, board_init_r			//第二个初始化C函数，board_init_r，从RAM执行
+ 	j	t9
+ 	move	a1, a2		/* delay slot			*/
+ 
+diff -uNr ./Uboot/drivers/spi_flash.c ./Uboot-mod/drivers/spi_flash.c
+--- ./Uboot/drivers/spi_flash.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/drivers/spi_flash.c	2024-09-23 23:42:18.140915000 +0800
+@@ -6,6 +6,9 @@
+ #include "ralink_spi.h"
+ 
+ 
++DECLARE_GLOBAL_DATA_PTR;				//gd
++register volatile ulong sp_addr asm ("sp");	//sp
++
+ #if (CONFIG_COMMANDS & CFG_CMD_SPI) 
+ 
+ /******************************************************************************
+@@ -129,7 +132,7 @@
+ #define SPIC_USER_MODE (1<<2)
+ #define SPIC_4B_ADDR (1<<3)
+ 
+-/*
++/*	SPI传输函数
+  * @cmd: command and address
+  * @n_cmd: size of command, in bytes
+  * @buf: buffer into which data will be read/written
+@@ -196,7 +199,7 @@
+ 	return retval;
+ }
+ 
+-static int spic_read(const u8 *cmd, size_t n_cmd, u8 *rxbuf, size_t n_rx)
++static int spic_read(const u8 *cmd, size_t n_cmd, u8 *rxbuf, size_t n_rx)	//spi读
+ {
+ 	return spic_transfer(cmd, n_cmd, rxbuf, n_rx, SPIC_READ_BYTES);
+ }
+@@ -207,10 +210,10 @@
+ }
+ 
+ extern unsigned long mips_bus_feq;
+-int spic_init(void)
++int spic_init(void)					//SPI初始化
+ {
+ 	// use normal(SPI) mode instead of GPIO mode
+-	ra_and(RT2880_GPIOMODE_REG, ~(1 << 1));
++	ra_and(RT2880_GPIOMODE_REG, ~(1 << 1));		//SPI Normal mode
+ #if defined (RT6855_ASIC_BOARD) || defined (RT6855_FPGA_BOARD)
+ 	ra_or(RT2880_GPIOMODE_REG, (1 << 11));
+ #elif defined (RT6352_ASIC_BOARD) || defined (RT6352_FPGA_BOARD) || \
+@@ -219,9 +222,9 @@
+ 	ra_and(RT2880_GPIOMODE_REG, ~(1 << 11));
+ #endif
+ 	// reset spi block
+-	ra_or(RT2880_RSTCTRL_REG, RSTCTRL_SPI_RESET);
++	ra_or(RT2880_RSTCTRL_REG, RSTCTRL_SPI_RESET);			//复位SPI
+ 	udelay(1);
+-	ra_and(RT2880_RSTCTRL_REG, ~RSTCTRL_SPI_RESET);
++	ra_and(RT2880_RSTCTRL_REG, ~RSTCTRL_SPI_RESET);			//结束SPI复位
+ 
+ #if defined(RALINK_VITESSE_SWITCH_CONNECT_SPI_CS1)
+         /* config ARB and set the low or high active correctly according to the device */
+@@ -235,12 +238,14 @@
+ 	ra_outl(RT2880_SPI0_CFG_REG, SPICFG_MSBFIRST | SPICFG_TXCLKEDGE_FALLING | SPICFG_SPICLK_DIV8 | SPICFG_SPICLKPOL | SPICFG_ADDRMODE);
+ #else
+ 	ra_outl(RT2880_SPI0_CFG_REG, SPICFG_MSBFIRST | SPICFG_TXCLKEDGE_FALLING | SPICFG_SPICLK_DIV8 | SPICFG_SPICLKPOL);
++		//SPICFG0：MSB在前，下降沿输出数据（上升沿采样），SPI分频8,空闲时钟为高
+ #endif
+ 								
+-	// set idle state
++	// set idle state	SPICTL0：SPIDO空闲高阻，SPIENA 引脚被置位
+ 	ra_outl(RT2880_SPI0_CTL_REG, SPICTL_HIZSDO | SPICTL_SPIENA_HIGH);
+ 
+ 	spi_wait_nsec = (8 * 1000 / ((mips_bus_feq / 1000 / 1000 / SPICFG_SPICLK_DIV8) )) >> 1 ;
++		//SPI等待的时间
+ 
+ 	printf("spi_wait_nsec: %x \n", spi_wait_nsec);
+ 	return 0;
+@@ -442,15 +447,15 @@
+ /*
+  * read SPI flash device ID
+  */
+-static int raspi_read_devid(u8 *rxbuf, int n_rx)
++static int raspi_read_devid(u8 *rxbuf, int n_rx)		//读spi flash id到缓冲区
+ {
+-	u8 code = OPCODE_RDID;
++	u8 code = OPCODE_RDID;		//Read JEDEC ID (9Fh)
+ 	int retval;
+ 
+ #ifdef COMMAND_MODE
+ 	retval = raspi_cmd(code, 0, 0, rxbuf, n_rx, 0, SPIC_READ_BYTES);
+ #else
+-	retval = spic_read(&code, 1, rxbuf, n_rx);
++	retval = spic_read(&code, 1, rxbuf, n_rx);		//发送查询ID指令读取数据
+ #endif
+ 	if (retval != n_rx) {
+ 		printf("%s: ret: %x\n", __func__, retval);
+@@ -788,27 +793,27 @@
+ 	return 0;
+ }
+ 
+-struct chip_info *chip_prob(void)
++struct chip_info *chip_prob(void)		//探查spi flash芯片
+ {
+ 	struct chip_info *info, *match;
+ 	u8 buf[5];
+ 	u32 jedec, weight;
+ 	int i;
+ 
+-	raspi_read_devid(buf, 5);
++	raspi_read_devid(buf, 5);			//读spi flash id	Read JEDEC ID
+ 	jedec = (u32)((u32)(buf[1] << 24) | ((u32)buf[2] << 16) | ((u32)buf[3] <<8) | (u32)buf[4]);
+ 
+ 	printf("spi device id: %x %x %x %x %x (%x)\n", buf[0], buf[1], buf[2], buf[3], buf[4], jedec);
+ 
+-	// FIXME, assign default as AT25D
++	// FIXME, assign default as AT25D		根据ID匹配 SPI flash
+ 	weight = 0xffffffff;
+ 	match = &chips_data[0];
+ 	for (i = 0; i < sizeof(chips_data)/sizeof(chips_data[0]); i++) {
+ 		info = &chips_data[i];
+ 		if (info->id == buf[0]) {
+ 			if (info->jedec_id == jedec) {
+-				printf("find flash: %s\n", info->name);
+-				return info;
++				printf("find flash: %s\n", info->name);		//找到spi flash
++				return info;								//返回信息
+ 			}
+ 
+ 			if (weight > (info->jedec_id ^ jedec)) {
+@@ -822,12 +827,12 @@
+ 	return match;
+ }
+ 
+-unsigned long raspi_init(void)
++unsigned long raspi_init(void)			//初始化SPI，得到flash容量
+ {
+-	spic_init();
+-	spi_chip_info = chip_prob();
++	spic_init();					//SPI初始化
++	spi_chip_info = chip_prob();	//探查芯片信息
+ 
+-	return spi_chip_info->sector_size * spi_chip_info->n_sectors;
++	return spi_chip_info->sector_size * spi_chip_info->n_sectors;		//返回容量
+ }
+ 
+ int raspi_erase(unsigned int offs, int len)
+@@ -1347,7 +1352,7 @@
+ 	"erase linux\n    - erase linux kernel block\n"
+ );
+ 
+-//#define SPI_FLASH_DBG_CMD 
++#define SPI_FLASH_DBG_CMD 
+ #ifdef SPI_FLASH_DBG_CMD
+ int ralink_spi_command(cmd_tbl_t *cmdtp, int flag, int argc, char *argv[])
+ {
+@@ -1408,19 +1413,109 @@
+ 		}
+ 	}
+ #endif
++	else if (!strncmp(argv[1], "fread", 6)) {	//add by hangbingli @ 2024-0908 spi fread  <flash addr> <mem addr> <len>
++		ulong faddr, maddr, len;
++		ulong sector_size = spi_chip_info ->sector_size;
++		ulong n_sectors = spi_chip_info -> n_sectors;
++		ulong max_faddr = sector_size * n_sectors;
++
++		faddr = simple_strtoul(argv[2], NULL, 16);		//address
++		maddr = simple_strtoul(argv[3], NULL, 16);
++		len = simple_strtoul(argv[4], NULL, 16);
++		
++		//limt
++		if( (faddr + len) >= max_faddr || faddr >= max_faddr)
++		{
++			printf("too large faddr or len, faddr = 0x%x, len = 0x%x, max = 0x%x\n",
++				 							faddr, len, max_faddr);
++			return 0;
++		}
++		if(maddr < CFG_SDRAM_BASE || (maddr + len) >= sp_addr)
++		{
++			printf("maddr or len out of range\n");
++			return 0;
++		}
++
++		raspi_read((char *)maddr, faddr, len);
++		
++		printf("\n");
++	}
++	else if (!strncmp(argv[1], "ferase", 7)) {//add by hangbingli @ 2024-0909 spi ferase <flash addr> <len>
++		ulong faddr, len;
++		int i;
++		ulong sector_size = spi_chip_info ->sector_size;
++		ulong n_sectors = spi_chip_info -> n_sectors;
++		ulong max_faddr = sector_size * n_sectors;
++
++		faddr = simple_strtoul(argv[2], NULL, 16);		//address
++		len = simple_strtoul(argv[3], NULL, 16);		//len
++
++		//limt
++		if( (faddr + len) >= max_faddr || faddr >= max_faddr)
++		{
++			printf("too large faddr or len, faddr = 0x%x, len = 0x%x, max = 0x%x\n",
++				 							faddr, len, max_faddr);
++			return 0;
++		}
++		if( faddr % sector_size != 0 || len % sector_size != 0)
++		{
++			printf("faddr or len not alligment with sector_size: 0x%x\n", sector_size);
++			return 0;
++		}
++
++		printf("\n Erase blocks !!\n");
++		printf("From 0x%X length 0x%X\n", faddr, len);
++		raspi_unprotect();
++		return raspi_erase(faddr, len);
++	}
++	else if (!strncmp(argv[1], "fwrite", 7)) {//add by hangbingli @ 2024-0909 spi fwrite <flash addr> <mem addr> <len>
++		ulong faddr, maddr, len;
++		u8* buffer;
++		int i;
++		ulong buffer_size = 1024;
++		ulong sector_size = spi_chip_info ->sector_size;
++		ulong n_sectors = spi_chip_info -> n_sectors;
++		ulong max_faddr = sector_size * n_sectors;
++
++		faddr = simple_strtoul(argv[2], NULL, 16);		//address
++		maddr = simple_strtoul(argv[3], NULL, 16);
++		len = simple_strtoul(argv[4], NULL, 16);
++
++		//limt
++		if( (faddr + len) >= max_faddr || faddr >= max_faddr)
++		{
++			printf("too large faddr or len, faddr = 0x%x, len = 0x%x, max = 0x%x\n",
++				 							faddr, len, max_faddr);
++			return 0;
++		}
++		if(maddr < CFG_SDRAM_BASE || (maddr + len) >= sp_addr)
++		{
++			printf("maddr or len out of range\n");
++			return 0;
++		}
++
++
++		raspi_write((char *)maddr, faddr, len);
++
++	}
+ 	else
+ 		printf("Usage:\n%s\n use \"help spi\" for detail!\n", cmdtp->usage);
+ 	return 0;
+ }
+ 
++
+ U_BOOT_CMD(
+-	spi,	4,	1, 	ralink_spi_command,
++	spi,	5,	1, 	ralink_spi_command,			//change 4->5
+ 	"spi	- spi command\n",
+ 	"spi usage:\n"
+ 	"  spi id\n"
+ 	"  spi sr read\n"
+ 	"  spi sr write <value>\n"
+ 	"  spi read <addr> <len>\n"
++	//add by hangbingli @ 2024-0908
++	"  spi fread  <flash addr> <mem addr> <len>\n"
++	"  spi ferase <flash addr> <len>\n"
++	"  spi fwrite <flash addr> <mem addr> <len>\n"
+ );
+ #endif
+ 
+diff -uNr ./Uboot/include/configs/rt2880.h ./Uboot-mod/include/configs/rt2880.h
+--- ./Uboot/include/configs/rt2880.h	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/include/configs/rt2880.h	2024-10-09 22:16:35.528946000 +0800
+@@ -80,7 +80,7 @@
+ 
+ #define SERIAL_CLOCK_DIVISOR 16
+ 
+-#define CONFIG_BOOTDELAY	30	/* autoboot after 30 seconds	*/
++#define CONFIG_BOOTDELAY	5	/* autoboot after 30 seconds	*/
+ 
+ #define CONFIG_WEBGPIO	0	/* use gpio 0 to trigger webpage	*/
+ 
+diff -uNr ./Uboot/lib_mips/board.c ./Uboot-mod/lib_mips/board.c
+--- ./Uboot/lib_mips/board.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/lib_mips/board.c	2024-09-27 21:23:34.345134000 +0800
+@@ -143,7 +143,7 @@
+ #ifdef ASIC_BOARD
+ 	u8	clk_sel, clk_sel2;
+ #endif
+-	reg = RALINK_REG(RT2880_SYSCFG_REG);
++	reg = RALINK_REG(RT2880_SYSCFG_REG);			//读SYSCFG0
+ 		
+ 	/* 
+ 	 * CPU_CLK_SEL (bit 21:20)
+@@ -213,7 +213,7 @@
+ 	clk_sel = ((reg>>8) & 0x01) + (clk_sel2 * 2);
+ 	switch(clk_sel) {
+ 		case 0:
+-			mips_cpu_feq = (360*1000*1000);
++			mips_cpu_feq = (360*1000*1000);		//360M
+ 			mips_bus_feq = (120*1000*1000);
+ 			break;
+ 		case 1:
+@@ -397,7 +397,8 @@
+ #if defined(ON_BOARD_SDR) && defined(ON_BOARD_256M_DRAM_COMPONENT)
+ 	{
+ 	u32 tREF;
+-	tREF = RALINK_REG(SDRAM_CFG1_REG);
++	tREF = RALINK_REG(SDRAM_CFG1_REG);	//SDRAM_CFG1: SDRAM Configuration 1
++			//配置SDRAM时序
+ 	tREF &= 0xffff0000;
+ #if defined(ASIC_BOARD)
+ 	tREF |= 0x00000300;
+@@ -416,18 +417,18 @@
+ /*
+  * The Malloc area is immediately below the monitor copy in DRAM
+  */
+-static void mem_malloc_init (void)
++static void mem_malloc_init (void)			//初始化堆区域
+ {
+ 
+ 	ulong dest_addr = CFG_MONITOR_BASE + gd->reloc_off;
+ 
+ 	mem_malloc_end = dest_addr;
+-	mem_malloc_start = dest_addr - TOTAL_MALLOC_LEN;
+-	mem_malloc_brk = mem_malloc_start;
++	mem_malloc_start = dest_addr - TOTAL_MALLOC_LEN;		//U-boot实体以下放置堆
++	mem_malloc_brk = mem_malloc_start;						//堆初始
+ 
+ 	memset ((void *) mem_malloc_start,
+ 		0,
+-		mem_malloc_end - mem_malloc_start);
++		mem_malloc_end - mem_malloc_start);			//将堆区域清零
+ }
+ 
+ void *sbrk (ptrdiff_t increment)
+@@ -470,8 +471,8 @@
+ #endif
+ 
+ 
+-	if ((gd->ram_size = initdram (board_type)) > 0) {
+-		print_size (gd->ram_size, "\n");
++	if ((gd->ram_size = initdram (board_type)) > 0) {			//检测获取SDRAM大小
++		print_size (gd->ram_size, "\n");		//打印RAM大小
+ 		return (0);  
+ 	}
+ 	puts ("*** failed ***\n");
+@@ -483,6 +484,7 @@
+ {
+    
+ 	printf ("\n\n%s\n\n", version_string);
++	//printf ("aaaaaaaaaaaaaaa\n");
+ 	return (0);
+ }
+ 
+@@ -546,14 +548,14 @@
+ #endif
+ 
+ 
+-//  
++//第一个初始化C函数
+ void board_init_f(ulong bootflag)
+ {
+ 	gd_t gd_data, *id;
+ 	bd_t *bd;  
+ 	//init_fnc_t **init_fnc_ptr;
+ 	//unsigned long  *pio_mode = (unsigned long  *)(0x00300624);
+-	ulong addr, addr_sp, len = (ulong)&uboot_end - CFG_MONITOR_BASE;
++	ulong addr, addr_sp, len = (ulong)&uboot_end - CFG_MONITOR_BASE;	//U-BOOT结尾-入口
+ 	ulong *s;
+ 	u32 value;
+   
+@@ -566,7 +568,7 @@
+ 	 */
+ 	gd = &gd_data;
+ 	/* compiler optimization barrier needed for GCC >= 3.4 */
+-	__asm__ __volatile__("": : :"memory");
++	__asm__ __volatile__("": : :"memory");		//内存屏障
+ 	
+ 		
+ 	memset ((void *)gd, 0, sizeof (gd_t));
+@@ -574,30 +576,31 @@
+ #if defined (RT6855A_ASIC_BOARD) || defined(RT6855A_FPGA_BOARD)	
+ 	watchdog_reset();
+ #endif
+-	timer_init();
+-	env_init();		/* initialize environment */
+-	init_baudrate();		/* initialze baudrate settings */
+-	serial_init();		/* serial communications setup */
+-	console_init_f();
+-	display_banner();		/* say that we are here */
+-	checkboard();
++	//一系列初始化函数
++	timer_init();		//协处理器定时器
++	env_init();		/* initialize environment */		//环境变量	env_spi.c
++	init_baudrate();		/* initialze baudrate settings */	//串口波特率57600
++	serial_init();		/* serial communications setup */		//初始化串口
++	console_init_f();											//控制台初始化
++	display_banner();		/* say that we are here */			//显示u-boot提示（最先输出输出）
++	checkboard();					//仅输出板子信息
+ 
+-	init_func_ram(); 
++	init_func_ram(); 				//检测RAM，获取RAM大小
+ 
+ 	/* reset Frame engine */
+-	value = le32_to_cpu(*(volatile u_long *)(RALINK_SYSCTL_BASE + 0x0034));
+-	udelay(100);    
++	value = le32_to_cpu(*(volatile u_long *)(RALINK_SYSCTL_BASE + 0x0034));	//RSTCTRL
++	udelay(100);    		//延时100us
+ #if defined (RT2880_FPGA_BOARD) || defined (RT2880_ASIC_BOARD)
+ 	value |= (1 << 18);
+ #else
+ 	//2880 -> 3052 reset Frame Engine from 18 to 21
+-	value |= (1 << 21);
++	value |= (1 << 21);			//Reset the frame engine block.
+ #endif
+ 	*(volatile u_long *)(RALINK_SYSCTL_BASE + 0x0034) = cpu_to_le32(value);	
+ #if defined (RT2880_FPGA_BOARD) || defined (RT2880_ASIC_BOARD)
+ 	value &= ~(1 << 18);
+ #else
+-	value &= ~(1 << 21);
++	value &= ~(1 << 21);		//结束复位
+ #endif
+ 	*(volatile u_long *)(RALINK_SYSCTL_BASE + 0x0034) = cpu_to_le32(value);	
+ 	udelay(200);      
+@@ -618,7 +621,7 @@
+ 	 * Now that we have DRAM mapped and working, we can
+ 	 * relocate the code and continue running from DRAM.
+ 	 */
+-	addr = CFG_SDRAM_BASE + gd->ram_size;
++	addr = CFG_SDRAM_BASE + gd->ram_size;			//SDRAM末端
+ 
+ 	/* We can reserve some RAM "on top" here.
+ 	 */
+@@ -630,7 +633,7 @@
+ 
+ 	/* round down to next 4 kB limit.
+ 	 */
+-	addr &= ~(4096 - 1);
++	addr &= ~(4096 - 1);			//向下圆整4K，这4K暂时预留
+ #ifdef DEBUG
+ 	debug ("Top of RAM usable for U-Boot at: %08lx\n", addr);
+ #endif	 
+@@ -638,14 +641,14 @@
+ 	/* Reserve memory for U-Boot code, data & bss
+ 	 * round down to next 16 kB limit
+ 	 */
+-	addr -= len;
+-	addr &= ~(16 * 1024 - 1);
++	addr -= len;						//U-BOOT长度，包含代码、数据和bss
++	addr &= ~(16 * 1024 - 1);			//向下圆整16K（U-boot重定向位置）
+ #ifdef DEBUG
+ 	debug ("Reserving %ldk for U-Boot at: %08lx\n", len >> 10, addr);
+ #endif
+ 	 /* Reserve memory for malloc() arena.
+ 	 */
+-	addr_sp = addr - TOTAL_MALLOC_LEN;
++	addr_sp = addr - TOTAL_MALLOC_LEN;			//预留堆区
+ #ifdef DEBUG
+ 	debug ("Reserving %dk for malloc() at: %08lx\n",
+ 			TOTAL_MALLOC_LEN >> 10, addr_sp);
+@@ -654,14 +657,14 @@
+ 	 * (permanently) allocate a Board Info struct
+ 	 * and a permanent copy of the "global" data
+ 	 */
+-	addr_sp -= sizeof(bd_t);
+-	bd = (bd_t *)addr_sp;
+-	gd->bd = bd;
++	addr_sp -= sizeof(bd_t);			//存放bd_t
++	bd = (bd_t *)addr_sp;				//板卡信息结构体
++	gd->bd = bd;						//保存到全局变量
+ #ifdef DEBUG
+ 	debug ("Reserving %d Bytes for Board Info at: %08lx\n",
+ 			sizeof(bd_t), addr_sp);
+ #endif
+-	addr_sp -= sizeof(gd_t);
++	addr_sp -= sizeof(gd_t);		//留一个gd_t给id，存放gd（当前gd为局部变量）
+ 	id = (gd_t *)addr_sp;
+ #ifdef DEBUG
+ 	debug ("Reserving %d Bytes for Global Data at: %08lx\n",
+@@ -669,8 +672,8 @@
+ #endif
+  	/* Reserve memory for boot params.
+ 	 */
+-	addr_sp -= CFG_BOOTPARAMS_LEN;
+-	bd->bi_boot_params = addr_sp;
++	addr_sp -= CFG_BOOTPARAMS_LEN;			//启用参数区域
++	bd->bi_boot_params = addr_sp;			//保存启动参数位置
+ #ifdef DEBUG
+ 	debug ("Reserving %dk for boot params() at: %08lx\n",
+ 			CFG_BOOTPARAMS_LEN >> 10, addr_sp);
+@@ -681,10 +684,10 @@
+ 	 * Leave some safety gap for SP, force alignment on 16 byte boundary
+ 	 * Clear initial stack frame
+ 	 */
+-	addr_sp -= 16;
+-	addr_sp &= ~0xF;
++	addr_sp -= 16;						//预留16字节
++	addr_sp &= ~0xF;					//栈顶16字节对齐
+ 	s = (ulong *)addr_sp;
+-	*s-- = 0;
++	*s-- = 0;						//下移并清零2字节
+ 	*s-- = 0;
+ 	addr_sp = (ulong)s;
+ #ifdef DEBUG
+@@ -692,7 +695,7 @@
+ #endif
+ 
+ 	/*
+-	 * Save local variables to board info struct
++	 * Save local variables to board info struct	板卡参数
+ 	 */
+ 	bd->bi_memstart	= CFG_SDRAM_BASE;	/* start of  DRAM memory */
+ 	bd->bi_memsize	= gd->ram_size;		/* size  of  DRAM memory in bytes */
+@@ -706,7 +709,7 @@
+ 	debug("\n bd->bi_total_image_size = 0x%08X\n",bd->bi_total_image_size);
+ #endif
+ 
+-	memcpy (id, (void *)gd, sizeof (gd_t));
++	memcpy (id, (void *)gd, sizeof (gd_t));			//存放gd到id
+ 
+ 	/* On the purple board we copy the code in a special way
+ 	 * in order to solve flash problems
+@@ -729,8 +732,8 @@
+ 	debug ("relocate_code Pointer at: %08lx\n", addr);
+ 	relocate_code (addr_sp, id, /*TEXT_BASE*/ addr);	
+ #else
+-	debug ("relocate_code Pointer at: %08lx\n", addr);
+-	relocate_code (addr_sp, id, addr);
++	debug ("relocate_code Pointer at: %08lx\n", addr);	//将u-boot本体（代码数据和bss）般移
++	relocate_code (addr_sp, id, addr);			//般移U-boo本体到指定地址，该函数不会返回
+ #endif
+ 
+ 	/* NOTREACHED - relocate_code() does not return */
+@@ -778,7 +781,7 @@
+ 	}
+ }	
+ 
+-int gpio_trigger_status(void){
++int gpio_trigger_status(void){			//获取触发GPIO状态
+ 
+ /*	if (ra_inl(GPIO_REG + 0x0020) & 0x0001 == 0x00000001){
+ 		return 1;
+@@ -1229,7 +1232,13 @@
+  */
+ 
+ gd_t gd_data;
+- 
++
++
++/*
++第二个板子初始化操作
++a0-a3 子函数调用的参数
++id参数未使用，dest_addr = 重定向后 U-boot 的入口地址
++*/
+ void board_init_r (gd_t *id, ulong dest_addr)
+ {
+ 	cmd_tbl_t *cmdtp;
+@@ -1260,7 +1269,8 @@
+ 	u32 dcache_linesz,dcache_sets,dcache_ways,dcache_size;
+ 
+ 	memcpy((void *)(CFG_SDRAM_BASE + DRAM_SIZE*0x100000 - 0x10000), (void *)gd, sizeof(gd_t));
+-	gd = (gd_t *)(CFG_SDRAM_BASE + DRAM_SIZE*0x100000- 0x10000);//&gd_data;
++			//全局变量实体移动到内存末端0x10000位置
++	gd = (gd_t *)(CFG_SDRAM_BASE + DRAM_SIZE*0x100000- 0x10000);//&gd_data;	//全局变量
+ #endif
+ 
+ #if defined(RT3052_ASIC_BOARD)
+@@ -1280,9 +1290,9 @@
+ 	//for(kk=0;kk <0x000fffff;kk++);
+ 
+ 	//gd = id;
+-	gd->flags |= GD_FLG_RELOC;	/* tell others: relocation done */
++	gd->flags |= GD_FLG_RELOC;	/* tell others: relocation done */	//代码已重定向到RAM
+ 
+-	Init_System_Mode(); /*  Get CPU rate */
++	Init_System_Mode(); /*  Get CPU rate */			//获取CPU时钟，配置SDRAM时序
+ 
+ #if defined(RT3052_ASIC_BOARD) || defined(RT3352_ASIC_BOARD) || defined(RT5350_ASIC_BOARD)
+ 	//turn on all Ethernet LEDs around 0.5sec.
+@@ -1306,10 +1316,10 @@
+ 	config_usbotg();
+ #elif defined(RT3883_ASIC_BOARD) || defined(RT3352_ASIC_BOARD) || defined(RT5350_ASIC_BOARD) || defined(RT6855_ASIC_BOARD) || defined (RT6352_ASIC_BOARD)
+ 	void config_usb_ehciohci(void);
+-	config_usb_ehciohci();
++	config_usb_ehciohci();		//关USB模块
+ #endif
+ 
+-	u32 reg = RALINK_REG(RT2880_RSTSTAT_REG);
++	u32 reg = RALINK_REG(RT2880_RSTSTAT_REG);		//检查复位状态
+ 	if(reg & RT2880_WDRST ){
+ 		printf("***********************\n");
+ 		printf("Watchdog Reset Occurred\n");
+@@ -1319,7 +1329,7 @@
+ 		trigger_hw_reset();
+ 	}else if(reg & RT2880_SWSYSRST){
+ 		printf("******************************\n");
+-		printf("Software System Reset Occurred\n");
++		printf("Software System Reset Occurred\n");			//软复位
+ 		printf("******************************\n");
+ 		RALINK_REG(RT2880_RSTSTAT_REG)|=RT2880_SWSYSRST;
+ 		RALINK_REG(RT2880_RSTSTAT_REG)&=~RT2880_SWSYSRST;
+@@ -1336,7 +1346,7 @@
+ #ifdef DEBUG
+ 	debug ("Now running in RAM - U-Boot at: %08lx\n", dest_addr);
+ #endif
+-	gd->reloc_off = dest_addr - CFG_MONITOR_BASE;
++	gd->reloc_off = dest_addr - CFG_MONITOR_BASE;		//重定向前后偏差
+ 
+ 	monitor_flash_len = (ulong)&uboot_end_data - dest_addr;
+ #ifdef DEBUG	
+@@ -1344,28 +1354,29 @@
+ #endif	
+ 	/*
+ 	 * We have to relocate the command table manually
++	 *	手动搬移命令表
+ 	 */
+ 	for (cmdtp = &__u_boot_cmd_start; cmdtp !=  &__u_boot_cmd_end; cmdtp++) {
+ 		ulong addr;
+ 
+-		addr = (ulong) (cmdtp->cmd) + gd->reloc_off;
++		addr = (ulong) (cmdtp->cmd) + gd->reloc_off;		//计算偏移后函数地址
+ #ifdef DEBUG
+ 		printf ("Command \"%s\": 0x%08lx => 0x%08lx\n",
+ 				cmdtp->name, (ulong) (cmdtp->cmd), addr);
+ #endif
+ 		cmdtp->cmd =
+-			(int (*)(struct cmd_tbl_s *, int, int, char *[]))addr;
++			(int (*)(struct cmd_tbl_s *, int, int, char *[]))addr;	//搬移后的函数地址
+ 
+-		addr = (ulong)(cmdtp->name) + gd->reloc_off;
++		addr = (ulong)(cmdtp->name) + gd->reloc_off;		//计算偏移后命令名地址
+ 		cmdtp->name = (char *)addr;
+ 
+ 		if (cmdtp->usage) {
+-			addr = (ulong)(cmdtp->usage) + gd->reloc_off;
++			addr = (ulong)(cmdtp->usage) + gd->reloc_off;	//用法字符串
+ 			cmdtp->usage = (char *)addr;
+ 		}
+ #ifdef	CFG_LONGHELP
+ 		if (cmdtp->help) {
+-			addr = (ulong)(cmdtp->help) + gd->reloc_off;
++			addr = (ulong)(cmdtp->help) + gd->reloc_off;	//帮助字符串
+ 			cmdtp->help = (char *)addr;
+ 		}
+ #endif
+@@ -1373,10 +1384,10 @@
+ 	}
+ 	/* there are some other pointer constants we must deal with */
+ #ifndef CFG_ENV_IS_NOWHERE
+-	env_name_spec += gd->reloc_off;
++	env_name_spec += gd->reloc_off;			//环境变量规格字符串
+ #endif
+ 
+-	bd = gd->bd;
++	bd = gd->bd;						//板卡信息
+ #if defined (CFG_ENV_IS_IN_NAND)
+ 	if ((size = ranand_init()) == (ulong)-1) {
+ 		printf("ra_nand_init fail\n");
+@@ -1386,12 +1397,12 @@
+ 	bd->bi_flashsize = size;
+ 	bd->bi_flashoffset = 0;
+ #elif defined (CFG_ENV_IS_IN_SPI)
+-	if ((size = raspi_init()) == (ulong)-1) {
++	if ((size = raspi_init()) == (ulong)-1) {		//初始化SPI，得到flash容量
+ 		printf("ra_spi_init fail\n");
+ 		while(1);
+ 	}
+ 	bd->bi_flashstart = 0;
+-	bd->bi_flashsize = size;
++	bd->bi_flashsize = size;			//flash容量
+ 	bd->bi_flashoffset = 0;
+ #else //CFG_ENV_IS_IN_FLASH
+ 	/* configure available FLASH banks */
+@@ -1407,13 +1418,13 @@
+ #endif //CFG_ENV_IS_IN_FLASH
+ 
+ 	/* initialize malloc() area */
+-	mem_malloc_init();
+-	malloc_bin_reloc();
++	mem_malloc_init();					//初始化堆
++	malloc_bin_reloc();					//重定位malloc用来维护chunk的数据结构
+ 
+ #if defined (CFG_ENV_IS_IN_NAND)
+ 	nand_env_init();
+ #elif defined (CFG_ENV_IS_IN_SPI)
+-	spi_env_init();
++	spi_env_init();						//初始化环境变量
+ #else //CFG_ENV_IS_IN_FLASH
+ #endif //CFG_ENV_IS_IN_FLASH
+ 
+@@ -1428,9 +1439,9 @@
+ #endif
+ 
+ 	/* relocate environment function pointers etc. */
+-	env_relocate();
++	env_relocate();					//分配并读取环境变量
+ 
+-	/* board MAC address */
++	/* board MAC address */			//板卡MAC地址
+ 	s = getenv ("ethaddr");
+ 	for (i = 0; i < 6; ++i) {
+ 		bd->bi_enetaddr[i] = s ? simple_strtoul (s, &e, 16) : 0;
+@@ -1439,7 +1450,7 @@
+ 	}
+ 
+ 	/* IP Address */
+-	bd->bi_ip_addr = getenv_IPaddr("ipaddr");
++	bd->bi_ip_addr = getenv_IPaddr("ipaddr");		//板卡IP
+ 
+ #if defined(CONFIG_PCI)
+ 	/*
+@@ -1451,20 +1462,20 @@
+ 
+ 	/** leave this here (after malloc(), environment and PCI are working) **/
+ 	/* Initialize devices */
+-	devices_init ();
++	devices_init ();			//初始化U-boot的设备（serial）
+ 
+-	jumptable_init ();
++	jumptable_init ();			//跳转函数表初始化
+ 
+ 	/* Initialize the console (after the relocation and devices init) */
+-	console_init_r ();
++	console_init_r ();			//初始化控制台（标准输入、输出和错误）
+ 
+ 	/* Initialize from environment */
+ 	if ((s = getenv ("loadaddr")) != NULL) {
+-		load_addr = simple_strtoul (s, NULL, 16);
++		load_addr = simple_strtoul (s, NULL, 16);			//加载地址
+ 	}
+ #if (CONFIG_COMMANDS & CFG_CMD_NET)
+ 	if ((s = getenv ("bootfile")) != NULL) {
+-		copy_filename (BootFile, s, sizeof (BootFile));
++		copy_filename (BootFile, s, sizeof (BootFile));		//启动文件
+ 	}
+ #endif	/* CFG_CMD_NET */
+ 
+@@ -1481,13 +1492,13 @@
+ #if defined(CFG_ENV_IS_IN_SPI) || defined (CFG_ENV_IS_IN_NAND)
+ 	{
+ 		int reg, boot_from_eeprom=0;
+-		reg = RALINK_REG(RT2880_SYSCFG_REG);
++		reg = RALINK_REG(RT2880_SYSCFG_REG);	//System Configuration Register 1
+ 		/* Uboot Version and Configuration*/
+ 		printf("============================================ \n");
+ 		printf("Ralink UBoot Version: %s\n", RALINK_LOCAL_VERSION);
+ 		printf("-------------------------------------------- \n");
+ 		printf("%s %s %s\n",CHIP_TYPE, CHIP_VERSION, GMAC_MODE);
+-		boot_from_eeprom = ((reg>>18) & 0x01);
++		boot_from_eeprom = ((reg>>18) & 0x01);	//此处DRAM configuration from boot strapping
+ 		if(boot_from_eeprom){
+ 		    printf("DRAM_CONF_FROM: EEPROM \n");
+ 		    printf("DRAM_SIZE: %d Mbits %s\n", DRAM_COMPONENT, DDR_INFO);
+@@ -1495,14 +1506,14 @@
+ 		    printf("TOTAL_MEMORY_SIZE: %d MBytes\n", DRAM_SIZE);
+ 		}else{
+ 		int dram_width, is_ddr2, dram_total_width, total_size;
+-		int _x = ((reg >> 12) & 0x7); 
++		int _x = ((reg >> 12) & 0x7); 		//BS：DRAM_SIZE
+ 
+ #if defined(RT3352_FPGA_BOARD) || defined (RT3352_ASIC_BOARD)
+ 		int dram_size = (_x == 6)? 2048 : (_x == 5)? 1024 : (_x == 4)? 512 : (_x == 3)? 256 : (_x == 2)? 128 : \
+ 				(_x == 1)? 64 : (_x == 0)? 16 : 0; 
+ #elif defined (RT5350_FPGA_BOARD) || defined (RT5350_ASIC_BOARD)
+ 		int dram_size = (_x == 4)? 512 : (_x == 3)? 256 : (_x == 2)? 128 : \
+-				(_x == 1)? 64 : (_x == 0)? 16 : 0; 
++				(_x == 1)? 64 : (_x == 0)? 16 : 0; 		//当前256
+ #elif defined (RT3883_FPGA_BOARD) || defined (RT3883_ASIC_BOARD)
+ 		int dram_size = (_x == 6)? 2048 : (_x == 5)? 1024 : (_x == 4)? 512 : \
+ 				(_x == 3)? 256 : (_x == 2)? 128 : (_x == 1)? 64 : \
+@@ -1511,10 +1522,10 @@
+ 		if(((reg >> 15) & 0x1)){
+ 		    dram_total_width = 32;
+ 		}else{
+-		    dram_total_width = 16;
++		    dram_total_width = 16;			//当前Reserved，为16bit
+ 		}
+ 
+-		is_ddr2 = ((reg >> 17) & 0x1);
++		is_ddr2 = ((reg >> 17) & 0x1);		//Reserved = 0
+ 		if(is_ddr2){
+ 		  if((reg >> 10) & 0x1){
+ 			dram_width = 16;
+@@ -1525,11 +1536,19 @@
+ 		  if((reg >> 10) & 0x1){
+ 			dram_width = 32;
+ 		  }else{
+-			dram_width = 16;
++			dram_width = 16;				//=0,16位宽
+ 		  }
+ 		}
+ 		total_size = (dram_size*(dram_total_width/dram_width))/8;
+ 
++		/*实测输出：
++		DRAM_CONF_FROM: Boot-Strapping 
++		DRAM_TYPE: SDRAM 
++		DRAM_SIZE: 256 Mbits
++		DRAM_WIDTH: 16 bits
++		DRAM_TOTAL_WIDTH: 16 bits
++		TOTAL_MEMORY_SIZE: 32 MBytes
++		*/
+ 		printf("DRAM_CONF_FROM: %s \n", boot_from_eeprom ? "EEPROM":"Boot-Strapping");
+ 		printf("DRAM_TYPE: %s \n", is_ddr2 ? "DDR2":"SDRAM");
+ 		printf("DRAM_SIZE: %d Mbits\n", dram_size);
+@@ -1747,6 +1766,7 @@
+ 		icache_ways *
+ 		icache_linesz;
+ 
++	/*实测：icache: sets:256, ways:4, linesz:32 ,total:32768*/
+ 	printf("icache: sets:%d, ways:%d, linesz:%d ,total:%d\n", 
+ 			icache_sets, icache_ways, icache_linesz, icache_size);
+ 
+@@ -1765,12 +1785,13 @@
+ 		dcache_ways *
+ 		dcache_linesz;
+ 
++	/*实测：dcache: sets:128, ways:4, linesz:32 ,total:16384*/
+ 	printf("dcache: sets:%d, ways:%d, linesz:%d ,total:%d \n", 
+ 			dcache_sets, dcache_ways, dcache_linesz, dcache_size);
+ 
+ #endif
+ 
+-	debug("\n ##### The CPU freq = %d MHZ #### \n",mips_cpu_feq/1000/1000);
++	debug("\n ##### The CPU freq = %d MHZ #### \n",mips_cpu_feq/1000/1000);	//360M
+ 
+ /*
+ 	if(*(volatile u_long *)(RALINK_SYSCTL_BASE + 0x0304) & (1<< 24))
+@@ -1782,13 +1803,13 @@
+ 		debug("\nSDRAM bus set to 16 bit \n");
+ 	}
+ */
+-	debug(" estimate memory size =%d Mbytes\n",gd->ram_size /1024/1024 );
++	debug(" estimate memory size =%d Mbytes\n",gd->ram_size /1024/1024 );	//32 Mbytes
+ 
+ 
+ #if defined (RT3052_ASIC_BOARD) || defined (RT3052_FPGA_BOARD)  || \
+     defined (RT3352_ASIC_BOARD) || defined (RT3352_FPGA_BOARD)  || \
+     defined (RT5350_ASIC_BOARD) || defined (RT5350_FPGA_BOARD)  
+-	rt305x_esw_init();
++	rt305x_esw_init();			//////////////////////////
+ #elif defined (RT6855_ASIC_BOARD) || defined (RT6855_FPGA_BOARD) || \
+       defined (RT6352_ASIC_BOARD) || defined (RT6352_FPGA_BOARD) || \
+       defined (RT71100_ASIC_BOARD) || defined (RT71100_FPGA_BOARD)
+@@ -1799,7 +1820,7 @@
+ #endif
+ 	rt6855A_gsw_init();
+ #endif
+-	LANWANPartition();
++	LANWANPartition();			///////////////////////
+ 
+ #ifdef DUAL_IMAGE_SUPPORT
+ 	check_image_validation();
+@@ -1808,45 +1829,45 @@
+ 	{
+ 	    char * s;
+ 	    s = getenv ("bootdelay");
+-	    timer1 = s ? (int)simple_strtol(s, NULL, 10) : CONFIG_BOOTDELAY;
++	    timer1 = s ? (int)simple_strtol(s, NULL, 10) : CONFIG_BOOTDELAY;//启动延时，s
+ 	}
+ 	int web_enabled, went_high = 0, went_low =0, gpio_trigger = 0, threeseconds = 0, web_timer = 0;
+ 	{
+ 	    char * s;
+-	    s = getenv ("webgpio");
++	    s = getenv ("webgpio");				//实测为GPIO0
+ 	    webgpio = s ? (int)simple_strtol(s, NULL, 10) : CONFIG_WEBGPIO;
+ 	}
+-	web_enabled = gpio_trigger_enable();
++	web_enabled = gpio_trigger_enable();		//设置IO为输入，检测IO，reset键默认为高
+ /*	gpio_trigger = gpio_trigger_status();*/
+ 	printf("GPIO %i is %s \n", webgpio, (gpio_trigger ? "high" : "low"));
+-	OperationSelect();   
++	OperationSelect();   		//打印选择提示信息
+ 
+-	while (timer1 > 0) {
++	while (timer1 > 0) {			//等待
+ 		--timer1;
+ 		/* delay 100 * 10ms */
+ 		for (i=0; i<100; ++i) {
+-			if ((my_tmp = tstc()) != 0) {	/* we got a key press	*/
++			if ((my_tmp = tstc()) != 0) {	/* we got a key press	*/	//检查串口是否收到数据
+ 				timer1 = 0;	/* no more delay	*/
+-				BootType = getc();
++				BootType = getc();				//获取输入字符
+ 				if ((BootType < '0' || BootType > '5') && (BootType != '7') && (BootType != '8') && (BootType != '9'))
+ 					BootType = '3';
+-				printf("\n\rYou chose %c\n\n", BootType);
++				printf("\n\rYou chose %c\n\n", BootType);		//根据串口输入跳出
+ 				break;
+ 			}
+-			web_timer++;
+-			if (gpio_trigger_status() != gpio_trigger){
+-				printf("GPIO %i went %s\n", webgpio, gpio_trigger ? "low" : "high");
++			web_timer++;			//每10ms +1
++			if (gpio_trigger_status() != gpio_trigger){			//如果IO翻转
++				printf("GPIO %i went %s\n", webgpio, gpio_trigger ? "low" : "high");//reset键，IO默认高，按下为低
+ 				if (gpio_trigger == 0){
+ 					went_high = web_timer;
+ 				}else{
+ 					went_low = web_timer;
+ 				}
+ 				if ( ((went_low - went_high) >= 300) && ((went_low - went_high) <= 500  )){
+-					BootType = '8';
++					BootType = '8';		//长按3s，启动选项8
+ 					break;
+ 				}
+ 				if ( ((went_low - went_high) >= 700) && ((went_low - went_high) <= 900  )){
+-					BootType = '1';
++					BootType = '1';		//长按7s，启动选项1
+ 					no_prompts = 1;
+ 					break;
+ 				}
+@@ -1864,31 +1885,31 @@
+ 				BootType = '8';
+ 				break;
+ 			}*/		
+-			udelay (10000);
++			udelay (10000);		//10ms（延时100次=1s）
+ 		}
+-		printf ("\b\b\b%2d ", timer1);
++		printf ("\b\b\b%2d ", timer1);			//打印等待计时
+ 	}
+ 	putc ('\n');
+ 
+-	if(BootType == '3') {
++	if(BootType == '3') {			//模式3,从flash启动Linux，默认方式
+ 		char *argv[2];
+ 		sprintf(addr_str, "0x%X", CFG_KERN_ADDR);
+ 		argv[1] = &addr_str[0];
+ 		printf("   \n3: System Boot system code via Flash.\n");
+-		do_bootm(cmdtp, 0, 2, argv);
++		do_bootm(cmdtp, 0, 2, argv);			//执行bootm指令
+ 	}
+ 	else {
+ 		char *argv[4];
+ 		int argc= 3;
+ 
+ 		argv[2] = &file_name_space[0];
+-		memset(file_name_space,0,ARGV_LEN);
++		memset(file_name_space,0,ARGV_LEN);		//文件名清零
+ 
+ #if (CONFIG_COMMANDS & CFG_CMD_NET)
+-		eth_initialize(gd->bd);
++		eth_initialize(gd->bd);			/////////////////////
+ #endif
+ 
+-		switch(BootType) {
++		switch(BootType) {			//根据输入选择，模式4进入控制台
+ 		case '1':
+ 			printf("   \n%d: System Load Linux to SDRAM via TFTP. \n", SEL_LOAD_LINUX_SDRAM);
+ 			tftp_config(SEL_LOAD_LINUX_SDRAM, argv);           
+@@ -2016,12 +2037,12 @@
+ 			break;
+ #endif
+ 
+-		case '4':
++		case '4':			//模式4,进入控制台
+ 			printf("   \n%d: System Enter Boot Command Line Interface.\n", SEL_ENTER_CLI);
+ 			printf ("\n%s\n", version_string);
+ 			/* main_loop() can return to retry autoboot, if so just run it again. */
+ 			for (;;) {					
+-				main_loop ();
++				main_loop ();			//U-boot 控制台主循环
+ 			}
+ 			break;
+ 		/*
+@@ -2395,21 +2416,21 @@
+ /*
+  * enter power saving mode
+  */
+-void config_usb_ehciohci(void)
++void config_usb_ehciohci(void)		//关USB模块
+ {
+ 	u32 val;
+ 	
+ 	val = RALINK_REG(RT2880_RSTCTRL_REG);    // toggle host & device RST bit
+-	val = val | RALINK_UHST_RST | RALINK_UDEV_RST;
+-	RALINK_REG(RT2880_RSTCTRL_REG) = val;
++	val = val | RALINK_UHST_RST | RALINK_UDEV_RST;	//复位USB host block和 USB device block
++	RALINK_REG(RT2880_RSTCTRL_REG) = val;	//RSTCTRL
+ 
+-	val = RALINK_REG(RT2880_CLKCFG1_REG);
++	val = RALINK_REG(RT2880_CLKCFG1_REG);	//CLKCFG1:Clock Configuration Register 1
+ #if defined(RT5350_ASIC_BOARD) || defined(RT6855_ASIC_BOARD)
+-	val = val & ~(RALINK_UPHY0_CLK_EN) ;  // disable USB port0 PHY. 
++	val = val & ~(RALINK_UPHY0_CLK_EN) ;  // disable USB port0 PHY.
+ #else
+ 	val = val & ~(RALINK_UPHY0_CLK_EN | RALINK_UPHY1_CLK_EN) ;  // disable USB port0 & port1 PHY. 
+ #endif
+-	RALINK_REG(RT2880_CLKCFG1_REG) = val;
++	RALINK_REG(RT2880_CLKCFG1_REG) = val;		//关闭UPHY0时钟
+ }
+ #endif /* (RT3883_ASIC_BOARD) || defined(RT3352_ASIC_BOARD)|| defined(RT5350_ASIC_BOARD) || defined(RT6855_ASIC_BOARD) || defined (RT6352_ASIC_BOARD) */
+ 
+diff -uNr ./Uboot/lib_mips/time.c ./Uboot-mod/lib_mips/time.c
+--- ./Uboot/lib_mips/time.c	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/lib_mips/time.c	2024-09-22 19:53:57.398876000 +0800
+@@ -40,11 +40,11 @@
+ 
+ 
+ 
+-static inline u32 mips_count_get(void)
++static inline u32 mips_count_get(void)		//获取Processor cycle count.
+ {
+ 	u32 count;
+ 
+-	asm volatile ("mfc0 %0, $9" : "=r" (count) :);
++	asm volatile ("mfc0 %0, $9" : "=r" (count) :);		//获取Processor cycle count.
+ 	return count;
+ }
+ 
+@@ -55,8 +55,8 @@
+ int timer_init(void)
+ {
+ 	
+-	mips_compare_set(0);
+-	mips_count_set(0);
++	mips_compare_set(0);		//Timer interrupt control.
++	mips_count_set(0);			//Processor cycle count.
+ 	
+ 	return 0;
+ }
+@@ -66,7 +66,7 @@
+ 	mips_count_set(0);
+ }
+ 
+-ulong get_timer(ulong base)
++ulong get_timer(ulong base)				//获取定时器相对计时
+ {
+ 	//printf("%s = %x\n", __FUNCTION__, mips_count_get() );
+ 	return mips_count_get() - base;
+@@ -77,12 +77,12 @@
+ 	mips_count_set(t);
+ }
+ 
+-void udelay (unsigned long usec)
++void udelay (unsigned long usec)		//微妙延时
+ {
+ 	ulong tmo;
+-	ulong start = get_timer(0);
++	ulong start = get_timer(0);		//获取定时器计时
+ 
+-	tmo = usec * ((mips_cpu_feq/2) / 1000000);
++	tmo = usec * ((mips_cpu_feq/2) / 1000000);			//等待间隔计算
+ 	while ((ulong)((mips_count_get() - start)) < tmo)
+ 		/*NOP*/;
+ }
+diff -uNr ./Uboot/Makefile ./Uboot-mod/Makefile
+--- ./Uboot/Makefile	2015-04-24 22:08:42.000000000 +0800
++++ ./Uboot-mod/Makefile	2024-08-17 18:04:49.022155000 +0800
+@@ -249,7 +249,7 @@
+ uboot.img:	uboot.bin
+ ifeq ($(CFG_ENV_IS), IN_SPI)
+ 		./tools/mkimage -A $(ARCH) -T standalone -C none \
+-		-a $(TEXT_BASE) -e $(shell readelf -h u-boot | grep "Entry" | awk '{print $$4}') \
++		-a $(TEXT_BASE) -e $(shell readelf -h u-boot | grep "入口点地址" | awk '{print $$2}') \
+ 		-n "$(shell echo $(CFG_ENV_IS) | sed -e 's/IN_//') Flash Image" \
+ 		-r $(DRAM_TYPE) -s $(DRAM_TOTAL_WIDTH) -t $(DRAM_SIZE) -u $(DRAM_WIDTH) \
+ 		-y $(DRAM_SYSCFG0) -z $(DRAM_SYSCFG1) -w $(CPU_PLL_CFG) -d $< $@
+diff -uNr "./Uboot/Uboot/\346\236\204\345\273\272\346\255\245\351\252\244" "./Uboot-mod/Uboot/\346\236\204\345\273\272\346\255\245\351\252\244"
+--- "./Uboot/Uboot/\346\236\204\345\273\272\346\255\245\351\252\244"	2024-10-13 16:56:11.576784973 +0800
++++ "./Uboot-mod/Uboot/\346\236\204\345\273\272\346\255\245\351\252\244"	1970-01-01 08:00:00.000000000 +0800
+@@ -1,68 +0,0 @@
+-环境：Ubuntu 22.04.4 LTS
+-
+-
+-make menuconfig
+-	Cross Compiler Path: 输入toolchain/bin的绝对路径（以/为开头的绝对路径）
+-	 (RT5350) Chip ID
+-	 (256Mb) DRAM Component
+-	
+-
+-直接make，根据报错补救
+-	./tools/mkimage: invalid entry point -n
+-		检查下最后执行的指令，./tools/mkimage...
+-			定位到顶层makefile，readelf -h u-boot | grep "Entry" | awk '{print $$4}'
+-		执行，readelf -h u-boot，可以发现，因为语言原因，“Entry“变成了“入口点地址”
+-			中文的输出对应行：
+-				入口点地址：               0x80200000
+-			如果将系统语言改为英文，输出如下
+-				Entry point address:               0x80200000
+-		把grep后面的“Entry“改成“入口点地址”，根据规律，还要改$$4为$$2
+-		即更改IN_SPI分支的readelf -h u-boot | grep "Entry" | awk '{print $$4}'为
+-			readelf -h u-boot | grep "入口点地址" | awk '{print $$2}'
+-	
+-
+-将得到的文件：uboot.img烧录到SPI Flash即可
+-
+-
+-
+-补丁1：实测发现在SecureCRT执行loadb指令无法下载超过8K的数据，因此更改kermit参数，取消扩展长度数据包特性。
+-	cmd_load.c：
+-		//a_b[++length] = tochar (2);	/* only long packets */
+-		a_b[++length] = tochar (0);	//delete all features by hangbingli
+-补丁2：添加spi flash操纵代码
+-	spi_flash.c：
+-		取消注释：#define SPI_FLASH_DBG_CMD 
+-		添加：spi fread、spi ferase及spi fwrite相关代码
+-补丁3：启用非必要的命令
+-	/config.mk
+-		UN_NECESSITY_U_BOOT_CMD_OPEN = ON
+-		该启用项需要执行 make menuconfig
+-补丁4：考虑取消扩展长度下载速度极慢，添加loadb_fst指令，继承原loadb
+-	cmd_load.c：
+-	修改loadb_fst指令中kermit协议扩展数据包最大长度为4096-2=4094
+-	实测此时比较稳定（CH340转串口）
+-补丁5：启动等待时间调整为5s
+-	rt2880.h:
+-		修改 #define CONFIG_BOOTDELAY	30	/* autoboot after 30 seconds	*/ 
+-		为 #define CONFIG_BOOTDELAY	5	/* autoboot after 30 seconds	*/
+-
+-U-BOOT调试：
+-	波特率57600 ，打开串口，开机按4
+-	加载img镜像：loadb 或 loadb_fst
+-	擦除：spi ferase 0 40000			#根据镜像大小设置
+-	写入：spi fwrite 0 80100000 xxxxx		#xxxxx是loadb下载的大小
+-	重启：reset
+-
+-无线参数烧录（镜像文件从原始固件取出，此处参考：https://openwrt.org/toh/7links/px4885）
+-	spi ferase 40000 10000
+-	loadb_fst
+-	spi fwrite 40000 0x80100000 10000
+-
+-openwrt烧录
+-	spi ferase 50000 800000
+-	loadb_fst
+-	spi fwrite 50000 0x80100000 xxxxxxxx
+-
+-
+-
+-
