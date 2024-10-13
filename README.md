@@ -5,6 +5,7 @@
 环境：Ubuntu 22.04.4 LTS
 
 
+
 make menuconfig
 	Cross Compiler Path: 输入toolchain/bin的绝对路径（以/为开头的绝对路径）
 	 (RT5350) Chip ID
