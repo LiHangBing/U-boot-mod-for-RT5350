@@ -2,7 +2,7 @@
 
 # 打补丁
 
-先下载这个[[noblepepper/ralink_sdk: RT5350 linux SDK from Ralink (github.com)](https://github.com/noblepepper/ralink_sdk)](链接)
+先下载这个[[noblepepper/ralink_sdk: RT5350 linux SDK from Ralink (github.com)](https://github.com/noblepepper/ralink_sdk/releases/tag/v0.1c)](链接)
 
 使用patch给其中的Uboot打补丁
 
